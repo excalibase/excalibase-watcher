@@ -55,10 +55,12 @@ public class CDCService {
 
     private final Map<String, Sinks.Many<CDCEvent>> tableSinks = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> tableSubscriberCounts = new ConcurrentHashMap<>();
+    private final Sinks.Many<CDCEvent> globalSink = Sinks.many().multicast().onBackpressureBuffer();
 
     @PreDestroy
     public void shutdown() {
         tableSinks.values().forEach(Sinks.Many::tryEmitComplete);
+        globalSink.tryEmitComplete();
         tableSubscriberCounts.clear();
         listenerRunning = false;
         log.info(WatcherLogConstant.CDC_SERVICE_STOPPED);
@@ -95,6 +97,15 @@ public class CDCService {
     }
 
     /**
+     * Returns a reactive stream of ALL CDC events across all tables.
+     * Intended for external publishers (e.g. NATS, Kafka) that need a single
+     * subscription point rather than per-table subscriptions.
+     */
+    public Flux<CDCEvent> getAllEventsFlux() {
+        return globalSink.asFlux();
+    }
+
+    /**
      * Route an incoming CDC event to the appropriate table sink.
      * Called by the database-specific listener (e.g. {@code PostgresCDCStartup}).
      */
@@ -119,6 +130,7 @@ public class CDCService {
                     }
                 }
 
+                globalSink.tryEmitNext(event);
                 Sinks.EmitResult result = sink.tryEmitNext(event);
                 if (result.isFailure()) {
                     log.warn(WatcherLogConstant.FAILED_EMIT_CDC, tableName, result);
@@ -185,9 +197,9 @@ public class CDCService {
         return sink;
     }
 
-    /** @return {@code true} if CDC is enabled and the listener has been started */
+    /** @return {@code true} if the listener has been started via {@link #markRunning()} */
     public boolean isRunning() {
-        return cdcEnabled && listenerRunning;
+        return listenerRunning;
     }
 
     /** @return {@code true} if CDC is enabled in configuration */

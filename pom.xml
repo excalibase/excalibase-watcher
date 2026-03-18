@@ -42,14 +42,20 @@
     <modules>
         <module>excalibase-watcher-core</module>
         <module>excalibase-watcher-postgres</module>
+        <module>excalibase-watcher-mysql</module>
+        <module>excalibase-watcher-nats</module>
+        <module>excalibase-watcher-sample</module>
     </modules>
 
     <properties>
         <java.version>21</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <postgresql.version>42.7.4</postgresql.version>
+        <mysql.connector.version>9.2.0</mysql.connector.version>
         <excalibase.watcher.version>0.0.1-SNAPSHOT</excalibase.watcher.version>
         <testcontainers.version>1.21.4</testcontainers.version>
+        <jnats.version>2.17.6</jnats.version>
+        <mysql.binlog.version>0.40.2</mysql.binlog.version>
     </properties>
 
     <dependencyManagement>
@@ -81,6 +87,21 @@
                 <artifactId>junit-jupiter</artifactId>
                 <version>${testcontainers.version}</version>
                 <scope>test</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.nats</groupId>
+                <artifactId>jnats</artifactId>
+                <version>${jnats.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.debezium</groupId>
+                <artifactId>mysql-binlog-connector-java</artifactId>
+                <version>${mysql.binlog.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.excalibase</groupId>
+                <artifactId>excalibase-watcher-nats</artifactId>
+                <version>${excalibase.watcher.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

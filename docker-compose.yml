@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: excalibase
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=5
+      - -c
+      - max_wal_senders=5
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: excalibase
+      MYSQL_USER: mysql
+      MYSQL_PASSWORD: mysql
+    command:
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --server-id=1
+    ports:
+      - "3308:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nats:
+    image: nats:2.10
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "/nats-server", "--help"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
