@@ -17,9 +17,12 @@
 package io.github.excalibase.watcher;
 
 import io.github.excalibase.watcher.constant.WatcherLogConstant;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -56,6 +59,12 @@ public class CDCService {
     private final Map<String, Sinks.Many<CDCEvent>> tableSinks = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> tableSubscriberCounts = new ConcurrentHashMap<>();
     private final Sinks.Many<CDCEvent> globalSink = Sinks.many().multicast().onBackpressureBuffer();
+
+    // Optional Micrometer metrics (null when actuator is not on classpath)
+    @Autowired(required = false)
+    private MeterRegistry meterRegistry;
+
+    private final Map<CDCEvent.Type, Counter> eventCounters = new ConcurrentHashMap<>();
 
     @PreDestroy
     public void shutdown() {
@@ -115,10 +124,28 @@ public class CDCService {
                     event.getType(), event.getTable(),
                     event.getData() != null ? event.getData().substring(0, Math.min(100, event.getData().length())) : "null");
 
+            if (meterRegistry != null) {
+                eventCounters.computeIfAbsent(event.getType(), t ->
+                        Counter.builder("cdc.events.total")
+                                .tag("type", t.name())
+                                .register(meterRegistry)
+                ).increment();
+            }
+
+            // DDL, BEGIN, COMMIT, HEARTBEAT have no table — emit to global sink only
+            if (event.getType() == CDCEvent.Type.DDL
+                    || event.getType() == CDCEvent.Type.BEGIN
+                    || event.getType() == CDCEvent.Type.COMMIT
+                    || event.getType() == CDCEvent.Type.HEARTBEAT) {
+                globalSink.tryEmitNext(event);
+                return;
+            }
+
             if (event.getTable() != null &&
                     (event.getType() == CDCEvent.Type.INSERT ||
                             event.getType() == CDCEvent.Type.UPDATE ||
-                            event.getType() == CDCEvent.Type.DELETE)) {
+                            event.getType() == CDCEvent.Type.DELETE ||
+                            event.getType() == CDCEvent.Type.TRUNCATE)) {
 
                 String tableName = event.getTable();
                 Sinks.Many<CDCEvent> sink = getOrCreateTableSink(tableName);

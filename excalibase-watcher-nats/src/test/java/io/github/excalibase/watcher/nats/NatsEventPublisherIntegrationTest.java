@@ -47,7 +47,7 @@ class NatsEventPublisherIntegrationTest {
         NatsProperties props = new NatsProperties();
         props.setUrl("nats://" + nats.getHost() + ":" + nats.getMappedPort(4222));
 
-        natsPublisher = new NatsEventPublisher(cdcService, props, new ObjectMapper());
+        natsPublisher = new NatsEventPublisher(cdcService, props, new ObjectMapper(), null);
         natsPublisher.start();
 
         consumerConnection = Nats.connect(props.getUrl());

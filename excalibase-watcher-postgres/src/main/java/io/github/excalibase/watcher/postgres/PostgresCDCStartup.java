@@ -17,6 +17,7 @@
 package io.github.excalibase.watcher.postgres;
 
 import io.github.excalibase.watcher.CDCService;
+import io.github.excalibase.watcher.snapshot.SnapshotMode;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -24,6 +25,9 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * Spring service that bootstraps the {@link PostgresCDCListener} and wires it to
@@ -36,15 +40,22 @@ import org.springframework.stereotype.Service;
  *
  * <p>Required configuration:</p>
  * <pre>{@code
- * spring.datasource.url=jdbc:postgresql://localhost:5432/mydb
- * spring.datasource.username=user
- * spring.datasource.password=secret
+ * # Use spring.datasource.* OR db-specific overrides (useful when running
+ * # both Postgres and MySQL listeners in the same Spring context)
+ * spring.datasource.url=jdbc:postgresql://localhost:5432/mydb    # OR: app.cdc.postgres.url=...
+ * spring.datasource.username=user                                # OR: app.cdc.postgres.username=...
+ * spring.datasource.password=secret                             # OR: app.cdc.postgres.password=...
  *
  * app.cdc.enabled=true
  * app.cdc.slot-name=cdc_slot
  * app.cdc.publication-name=cdc_publication
  * app.cdc.create-slot-if-not-exists=true
  * app.cdc.create-publication-if-not-exists=true
+ *
+ * # Optional
+ * app.cdc.postgres.tables=orders,users    # empty = watch all tables
+ * app.cdc.postgres.snapshot-mode=NONE    # NONE | CHUNKED
+ * app.cdc.postgres.snapshot-chunk-size=10000
  * }</pre>
  */
 @Service
@@ -55,16 +66,16 @@ public class PostgresCDCStartup {
     @Autowired
     private CDCService cdcService;
 
-    @Value("${spring.datasource.url}")
+    @Value("${app.cdc.postgres.url:${spring.datasource.url}}")
     private String jdbcUrl;
 
-    @Value("${spring.datasource.username}")
+    @Value("${app.cdc.postgres.username:${spring.datasource.username}}")
     private String username;
 
-    @Value("${spring.datasource.password}")
+    @Value("${app.cdc.postgres.password:${spring.datasource.password}}")
     private String password;
 
-    @Value("${app.cdc.enabled:true}")
+    @Value("${app.cdc.postgres.enabled:${app.cdc.enabled:true}}")
     private boolean cdcEnabled;
 
     @Value("${app.cdc.slot-name:cdc_slot}")
@@ -79,6 +90,18 @@ public class PostgresCDCStartup {
     @Value("${app.cdc.create-publication-if-not-exists:true}")
     private boolean createPublicationIfNotExists;
 
+    @Value("${app.cdc.postgres.tables:}")
+    private String tablesConfig;
+
+    @Value("${app.cdc.postgres.snapshot-mode:NONE}")
+    private String snapshotModeConfig;
+
+    @Value("${app.cdc.postgres.snapshot-chunk-size:10000}")
+    private int snapshotChunkSize;
+
+    @Value("${app.cdc.postgres.capture-ddl:false}")
+    private boolean captureDdl;
+
     private PostgresCDCListener cdcListener;
 
     @PostConstruct
@@ -88,6 +111,15 @@ public class PostgresCDCStartup {
             return;
         }
 
+        List<String> tables = tablesConfig.isBlank()
+                ? List.of()
+                : Arrays.stream(tablesConfig.split(","))
+                        .map(String::trim)
+                        .filter(s -> !s.isBlank())
+                        .toList();
+
+        SnapshotMode snapshotMode = SnapshotMode.valueOf(snapshotModeConfig.trim().toUpperCase());
+
         cdcListener = new PostgresCDCListener.Builder()
                 .jdbcUrl(jdbcUrl)
                 .credentials(username, password)
@@ -95,6 +127,10 @@ public class PostgresCDCStartup {
                 .publicationName(publicationName)
                 .createSlotIfNotExists(createSlotIfNotExists)
                 .createPublicationIfNotExists(createPublicationIfNotExists)
+                .tables(tables)
+                .snapshotMode(snapshotMode)
+                .snapshotChunkSize(snapshotChunkSize)
+                .captureDdl(captureDdl)
                 .eventHandler(cdcService::handleCDCEvent)
                 .build();
 

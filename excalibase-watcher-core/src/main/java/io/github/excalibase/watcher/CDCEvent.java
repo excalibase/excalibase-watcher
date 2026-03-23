@@ -27,7 +27,7 @@ package io.github.excalibase.watcher;
 public class CDCEvent {
 
     public enum Type {
-        BEGIN, COMMIT, INSERT, UPDATE, DELETE
+        BEGIN, COMMIT, INSERT, UPDATE, DELETE, DDL, TRUNCATE, HEARTBEAT
     }
 
     private final Type type;
@@ -37,9 +37,15 @@ public class CDCEvent {
     private final String rawMessage;
     private final String lsn;
     private final long timestamp;
+    private final long sourceTimestamp; // epoch millis from the DB, 0 if unknown
 
     public CDCEvent(Type type, String schema, String table, String data,
                     String rawMessage, String lsn) {
+        this(type, schema, table, data, rawMessage, lsn, 0L);
+    }
+
+    public CDCEvent(Type type, String schema, String table, String data,
+                    String rawMessage, String lsn, long sourceTimestamp) {
         this.type = type;
         this.schema = schema;
         this.table = table;
@@ -47,6 +53,7 @@ public class CDCEvent {
         this.rawMessage = rawMessage;
         this.lsn = lsn;
         this.timestamp = System.currentTimeMillis();
+        this.sourceTimestamp = sourceTimestamp;
     }
 
     public Type getType() { return type; }
@@ -58,6 +65,9 @@ public class CDCEvent {
     /** Log Sequence Number as a string, or {@code null} if not applicable */
     public String getLsn() { return lsn; }
     public long getTimestamp() { return timestamp; }
+
+    /** Timestamp from the source database (epoch millis), or 0 if unavailable */
+    public long getSourceTimestamp() { return sourceTimestamp; }
 
     @Override
     public String toString() {

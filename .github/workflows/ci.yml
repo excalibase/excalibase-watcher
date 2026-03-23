@@ -1,0 +1,133 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  MAVEN_OPTS: "-Djava.awt.headless=true"
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-at-end --show-version"
+
+jobs:
+  test:
+    name: Run Tests & Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      statuses: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'corretto'
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+
+    - name: Run tests with coverage
+      run: mvn clean verify ${{ env.MAVEN_CLI_OPTS }}
+
+    - name: Add coverage to PR
+      id: jacoco
+      uses: madrapps/jacoco-report@v1.7.2
+      if: github.event_name == 'pull_request'
+      with:
+        paths: |
+          ${{ github.workspace }}/excalibase-watcher-core/target/site/jacoco/jacoco.xml,
+          ${{ github.workspace }}/excalibase-watcher-postgres/target/site/jacoco/jacoco.xml,
+          ${{ github.workspace }}/excalibase-watcher-mysql/target/site/jacoco/jacoco.xml,
+          ${{ github.workspace }}/excalibase-watcher-nats/target/site/jacoco/jacoco.xml,
+          ${{ github.workspace }}/excalibase-watcher-api/target/site/jacoco/jacoco.xml
+        token: ${{ secrets.GITHUB_TOKEN }}
+        min-coverage-overall: 40
+        min-coverage-changed-files: 60
+
+    - name: Cache SonarQube packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.sonar/cache
+        key: ${{ runner.os }}-sonar
+        restore-keys: ${{ runner.os }}-sonar
+
+    - name: SonarQube analysis
+      if: env.SONAR_TOKEN != ''
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        PR_KEY: ${{ github.event.number }}
+        PR_BRANCH: ${{ github.head_ref }}
+        PR_BASE: ${{ github.base_ref }}
+        BRANCH_NAME: ${{ github.ref_name }}
+        REPO: ${{ github.repository }}
+        EVENT_NAME: ${{ github.event_name }}
+      run: |
+        JACOCO_PATHS=$(find . -path "*/target/site/jacoco/jacoco.xml" | paste -sd ',')
+        if [ "$EVENT_NAME" = "pull_request" ]; then
+          SONAR_EXTRA="-Dsonar.pullrequest.key=$PR_KEY \
+            -Dsonar.pullrequest.branch=$PR_BRANCH \
+            -Dsonar.pullrequest.base=$PR_BASE \
+            -Dsonar.pullrequest.provider=github \
+            -Dsonar.pullrequest.github.repository=$REPO"
+        else
+          SONAR_EXTRA="-Dsonar.branch.name=$BRANCH_NAME"
+        fi
+        mvn sonar:sonar ${{ env.MAVEN_CLI_OPTS }} \
+          -Dsonar.projectKey=Excalibase-Watcher \
+          "-Dsonar.projectName=Excalibase Watcher" \
+          -Dsonar.coverage.jacoco.xmlReportPaths=$JACOCO_PATHS \
+          $SONAR_EXTRA
+
+    - name: Upload coverage reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: coverage-reports
+        path: '**/target/site/jacoco/'
+        retention-days: 7
+
+  build:
+    name: Build & Package
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'corretto'
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+
+    - name: Build JAR (skip tests — already passed)
+      run: mvn package -DskipTests ${{ env.MAVEN_CLI_OPTS }}
+
+    - name: Upload JAR artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: jar-artifacts
+        path: excalibase-watcher-api/target/*.jar
+        retention-days: 7

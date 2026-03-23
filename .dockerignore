@@ -1,0 +1,13 @@
+**/target/*-sources.jar
+**/target/*-javadoc.jar
+**/target/*-sample-*.jar
+**/target/maven-*
+**/target/classes
+**/target/test-classes
+**/target/surefire-reports
+**/target/generated-sources
+**/target/generated-test-sources
+**/.git
+**/.idea
+**/.vscode
+**/node_modules

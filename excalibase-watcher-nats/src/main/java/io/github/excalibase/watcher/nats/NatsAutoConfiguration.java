@@ -2,6 +2,8 @@ package io.github.excalibase.watcher.nats;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.excalibase.watcher.CDCService;
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -28,7 +30,8 @@ public class NatsAutoConfiguration {
     @Bean
     public NatsEventPublisher natsEventPublisher(CDCService cdcService,
                                                   NatsProperties natsProperties,
-                                                  ObjectMapper objectMapper) {
-        return new NatsEventPublisher(cdcService, natsProperties, objectMapper);
+                                                  ObjectMapper objectMapper,
+                                                  @Autowired(required = false) MeterRegistry meterRegistry) {
+        return new NatsEventPublisher(cdcService, natsProperties, objectMapper, meterRegistry);
     }
 }

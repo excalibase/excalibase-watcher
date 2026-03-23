@@ -1,28 +1,53 @@
 # excalibase-watcher
 
-A lightweight Java CDC (Change Data Capture) library that streams database changes to NATS JetStream. Any service — in any language — can subscribe to real-time INSERT, UPDATE, and DELETE events without touching the database.
+A lightweight Java CDC (Change Data Capture) server that streams database changes to NATS JetStream in real-time. Supports PostgreSQL (WAL) and MySQL (binlog). Any service in any language can subscribe to INSERT, UPDATE, DELETE, DDL, and TRUNCATE events without touching the database.
 
 ```
 [Postgres WAL / MySQL binlog]
-          ↓
-  excalibase-watcher-sample  (or your own Spring Boot app)
-          ↓
-    NATS JetStream  (subject: cdc.{schema}.{table})
-          ↓
-  inventory-svc  |  search-indexer  |  audit-logger  |  ...
+          |
+  excalibase-watcher-api   (Spring Boot server)
+          |
+    NATS JetStream
+      |         |         |
+  cdc.public.orders   cdc.public.users   cdc.public._ddl
+      |         |         |
+  inventory-svc   search-indexer   schema-tracker
 ```
+
+---
+
+## Features
+
+| Feature | Postgres | MySQL |
+|---------|----------|-------|
+| INSERT / UPDATE / DELETE | pgoutput WAL stream | binlog replication |
+| DDL capture (CREATE/ALTER/DROP) | Event trigger + `_cdc_ddl_log` table | QUERY event filtering |
+| TRUNCATE events | pgoutput 'T' message | N/A |
+| Transaction boundaries (BEGIN/COMMIT) | pgoutput B/C messages | XID + QUERY events |
+| Real column names | From RELATION message | From INFORMATION_SCHEMA |
+| Type-aware JSON | INT/FLOAT/NUMERIC as numbers, BOOL as boolean | Date/Timestamp as ISO, BigDecimal as number, binary as base64 |
+| Table filtering | `app.cdc.postgres.tables=orders,users` | `app.cdc.mysql.tables=orders,users` |
+| Chunked snapshot | JDBC SELECT before CDC starts | JDBC SELECT before CDC starts |
+| Dump file snapshot | Parse `pg_dump` COPY format | Parse `mysqldump` INSERT format |
+| Reconnect with backoff | Exponential 1s to 30s | Exponential 1s to 30s |
+| Heartbeat (WAL bloat prevention) | Every 30s of inactivity | Built-in via binlog connector |
+| Offset persistence | Replication slot (server-side) | `FileBinlogOffsetStore` (file) |
+| Source timestamps | From pgoutput BEGIN message | From binlog event header |
+| Schema history | `FileSchemaHistoryStore` (JSON per table) | Interface ready |
+| Health check | Spring Actuator `/actuator/health` | Same |
+| Metrics | Micrometer `cdc.events.total`, `cdc.nats.published` | Same |
 
 ---
 
 ## Modules
 
 | Module | Description |
-|---|---|
-| `excalibase-watcher-core` | `CDCService` + `CDCEvent` — pure Java, no Spring required for usage |
-| `excalibase-watcher-postgres` | PostgreSQL WAL listener (logical replication, pgoutput protocol) |
-| `excalibase-watcher-mysql` | MySQL binlog listener (real-time replication stream, same mechanism as Debezium) |
-| `excalibase-watcher-nats` | NATS JetStream publisher — bridges CDCService to NATS |
-| `excalibase-watcher-sample` | Runnable Spring Boot demo wired to docker-compose |
+|--------|-------------|
+| `excalibase-watcher-core` | `CDCService` + `CDCEvent` + health indicator + schema history |
+| `excalibase-watcher-postgres` | PostgreSQL WAL listener (`PostgresCDCListener` + `PgOutputParser`) |
+| `excalibase-watcher-mysql` | MySQL binlog listener (`MysqlBinlogListener`) |
+| `excalibase-watcher-nats` | NATS JetStream publisher |
+| `excalibase-watcher-api` | Spring Boot CDC server + E2E tests |
 
 ---
 
@@ -35,78 +60,149 @@ docker compose up -d
 ```
 
 Starts:
-- **PostgreSQL 16** on `localhost:5432` — `wal_level=logical` pre-configured
-- **MySQL 8.0** on `localhost:3308`
-- **NATS 2.10** on `localhost:4222` (JetStream enabled), monitoring on `localhost:8222`
+- **PostgreSQL 16** on `localhost:5432` — `wal_level=logical`
+- **MySQL 8.0** on `localhost:3308` — `binlog_format=ROW`
+- **NATS 2.10** on `localhost:4222` (JetStream enabled)
 
-### 2. Run the sample app
+### 2. Run the server
 
 ```bash
-mvn spring-boot:run -pl excalibase-watcher-sample
+mvn spring-boot:run -pl excalibase-watcher-api
 ```
 
 On startup it:
-- Connects to Postgres and auto-creates a replication slot + publication
-- Connects to NATS and creates a `CDC` JetStream stream
-- Logs every CDC event to console
+- Connects to Postgres WAL and MySQL binlog
+- Auto-creates replication slot, publication, and DDL event triggers
+- Creates a NATS JetStream stream (`CDC`)
+- Publishes all CDC events to `cdc.{schema}.{table}`
+- Exposes health at `http://localhost:8080/actuator/health`
 
 ### 3. Make some changes
 
 ```sql
--- connect to postgres: localhost:5432 / user: postgres / pass: postgres / db: excalibase
-
+-- Postgres (localhost:5432, user: postgres, pass: postgres, db: excalibase)
 CREATE TABLE orders (
     id      SERIAL PRIMARY KEY,
     product VARCHAR(100),
     qty     INT,
-    status  VARCHAR(20) DEFAULT 'pending'
+    price   NUMERIC(10,2)
 );
+ALTER TABLE orders REPLICA IDENTITY FULL;
 
-INSERT INTO orders (product, qty) VALUES ('keyboard', 2);
-INSERT INTO orders (product, qty) VALUES ('mouse', 5);
-UPDATE orders SET status = 'shipped', qty = 1 WHERE product = 'keyboard';
-DELETE FROM orders WHERE product = 'mouse';
+INSERT INTO orders (product, qty, price) VALUES ('keyboard', 2, 49.99);
+UPDATE orders SET qty = 1 WHERE product = 'keyboard';
+DELETE FROM orders WHERE product = 'keyboard';
+TRUNCATE TABLE orders;
 ```
 
 ### 4. Watch the events
 
-Sample app console:
+Server console output:
 ```
-[CDC] type=INSERT schema=public table=orders lsn=0/1989540 data={"col_0":"1","col_1":"keyboard","col_2":"2","col_3":"pending"}
-[CDC] type=INSERT schema=public table=orders lsn=0/1989668 data={"col_0":"2","col_1":"mouse","col_2":"5","col_3":"pending"}
-[CDC] type=UPDATE schema=public table=orders lsn=0/1989760 data={"new":{"col_0":"1","col_1":"keyboard","col_2":"1","col_3":"shipped"}}
-[CDC] type=DELETE schema=public table=orders lsn=0/19897F0 data={"col_0":"2","col_1":null,"col_2":null,"col_3":null}
+[CDC] INSERT public.orders data={"id":1, "product":"keyboard", "qty":2, "price":49.99}
+[CDC] UPDATE public.orders data={"old":{"id":1, "product":"keyboard", "qty":2, "price":49.99}, "new":{"id":1, "product":"keyboard", "qty":1, "price":49.99}}
+[CDC] DELETE public.orders data={"id":1, "product":"keyboard", "qty":1, "price":49.99}
+[CDC] TRUNCATE public.orders
+[CDC] DDL public.null data={"command_tag":"CREATE TABLE", "object_identity":"public.orders", ...}
 ```
 
-> Add `ALTER TABLE orders REPLICA IDENTITY FULL;` to get full old row data in UPDATE/DELETE (see [PostgreSQL setup](#postgresql-setup-requirements)).
+Note: numeric values (`qty`, `price`) are JSON numbers, not strings. Booleans are JSON booleans.
 
 ---
 
-## NATS message format
+## NATS subject format
 
-Every event is published as JSON to subject `cdc.{schema}.{table}`:
+| Event type | Subject | Example |
+|-----------|---------|---------|
+| DML (INSERT/UPDATE/DELETE) | `{prefix}.{schema}.{table}` | `cdc.public.orders` |
+| TRUNCATE | `{prefix}.{schema}.{table}` | `cdc.public.orders` |
+| DDL | `{prefix}.{schema}._ddl` | `cdc.public._ddl` |
+
+Wildcard subscription: `cdc.>` receives all events.
+
+### NATS message payload
 
 ```json
 {
   "type": "INSERT",
   "schema": "public",
   "table": "orders",
-  "data": "{\"col_0\":\"1\", \"col_1\":\"keyboard\", \"col_2\":\"2\", \"col_3\":\"pending\"}",
+  "data": "{\"id\":1, \"product\":\"keyboard\", \"qty\":2, \"price\":49.99}",
   "rawMessage": "INSERT",
   "lsn": "0/1989540",
-  "timestamp": 1742056200000
+  "timestamp": 1742056200000,
+  "sourceTimestamp": 1742056199500
 }
 ```
 
-> **Postgres vs MySQL data format difference:**
-> - **MySQL** uses real column names: `{"id": 1, "name": "laptop", "price": 999.99}`
-> - **Postgres** uses positional names: `{"col_0": "1", "col_1": "laptop", "col_2": "999.99"}` — the pgoutput WAL format does not include column names inline. Column name resolution is a planned improvement.
+- `timestamp` — when the watcher processed the event (epoch millis)
+- `sourceTimestamp` — when the database committed the change (epoch millis, 0 if unavailable)
+
+---
+
+## Architecture
+
+```
+excalibase-watcher-api  ← the CDC server (you deploy this)
+  connects to: Postgres / MySQL
+  publishes to: NATS JetStream
+
+your-spring-app  ← your service (no excalibase dependency needed)
+  subscribes to: NATS JetStream
+  receives: CDC events as JSON
+```
+
+The watcher-api is a standalone server. Your services are pure NATS consumers — **no CDC library dependency, any language works**.
 
 ---
 
 ## Consuming events
 
-Any NATS client in any language can subscribe. Multiple independent consumers each get every message.
+### Spring Boot (Java)
+
+No excalibase dependency needed — just `jnats`:
+
+```xml
+<dependency>
+    <groupId>io.nats</groupId>
+    <artifactId>jnats</artifactId>
+    <version>2.17.6</version>
+</dependency>
+```
+
+```java
+@Service
+public class OrderChangeListener {
+
+    @Value("${app.nats.url:nats://localhost:4222}")
+    private String natsUrl;
+
+    @PostConstruct
+    void subscribe() throws Exception {
+        Connection nc = Nats.connect(natsUrl);
+        JetStream js = nc.jetStream();
+
+        ConsumerConfiguration cc = ConsumerConfiguration.builder()
+                .durable("my-order-service")       // survives restarts
+                .deliverPolicy(DeliverPolicy.New)  // only new events
+                .build();
+        PushSubscribeOptions opts = PushSubscribeOptions.builder()
+                .stream("CDC")
+                .configuration(cc)
+                .build();
+
+        // Listen to a specific table
+        js.subscribe("cdc.public.orders", opts, msg -> {
+            String json = new String(msg.getData());
+            System.out.println("Order changed: " + json);
+            msg.ack();
+        });
+
+        // Or listen to all changes: js.subscribe("cdc.>", opts, handler);
+        // Or DDL only: js.subscribe("cdc.public._ddl", opts, handler);
+    }
+}
+```
 
 ### Node.js
 
@@ -117,7 +213,7 @@ const nc = await connect({ servers: 'nats://localhost:4222' })
 const js = nc.jetstream()
 
 const opts = consumerOpts()
-opts.durable('my-service')   // survives restarts
+opts.durable('my-service')
 opts.deliverAll()
 opts.ackExplicit()
 
@@ -129,100 +225,115 @@ for await (const msg of sub) {
 }
 ```
 
-### Scaling (multiple pods)
+### Load balancing across pods
 
 ```js
-// Same durable name + queue group = load-balanced across pods, each message processed once
 opts.durable('inventory-service')
-opts.queue('inventory-service')   // <-- add this when scaling
+opts.queue('inventory-service')  // messages distributed across pods
 ```
 
-Without `queue()` each pod gets every message (fan-out). With `queue()` messages are distributed across pods (load balance).
+Without `queue()` each pod gets every message (fan-out). With `queue()` messages are load-balanced.
 
 ---
 
-## PostgreSQL setup requirements
+## Configuration reference
 
-PostgreSQL must have `wal_level = logical`. This is pre-configured in the provided `docker-compose.yml`. For an existing Postgres:
+### Postgres CDC
+
+```properties
+# Connection (falls back to spring.datasource.* if not set)
+app.cdc.postgres.url=jdbc:postgresql://localhost:5432/mydb
+app.cdc.postgres.username=postgres
+app.cdc.postgres.password=postgres
+app.cdc.postgres.enabled=true
+
+# Replication
+app.cdc.slot-name=cdc_slot
+app.cdc.publication-name=cdc_publication
+app.cdc.create-slot-if-not-exists=true
+app.cdc.create-publication-if-not-exists=true
+
+# Table filtering (empty = all tables)
+app.cdc.postgres.tables=orders,users
+
+# DDL capture via event triggers
+app.cdc.postgres.capture-ddl=false
+
+# Snapshot
+app.cdc.postgres.snapshot-mode=NONE          # NONE | CHUNKED | BACKUP_FILE
+app.cdc.postgres.snapshot-chunk-size=10000
+```
+
+### MySQL CDC
+
+```properties
+# Connection (falls back to spring.datasource.* if not set)
+app.cdc.mysql.url=jdbc:mysql://localhost:3306/mydb
+app.cdc.mysql.username=root
+app.cdc.mysql.password=secret
+app.cdc.mysql.enabled=true
+
+# Table filtering (empty = all tables)
+app.cdc.mysql.tables=orders,users
+
+# Snapshot
+app.cdc.mysql.snapshot-mode=NONE             # NONE | CHUNKED | BACKUP_FILE
+app.cdc.mysql.snapshot-chunk-size=10000
+
+# Offset persistence (resume from last position after restart)
+app.cdc.mysql.offset-store.file=/var/lib/watcher/binlog.offset
+```
+
+### NATS JetStream
+
+```properties
+app.nats.url=nats://localhost:4222
+app.nats.stream-name=CDC
+app.nats.subject-prefix=cdc
+app.nats.storage=memory                      # memory | file
+app.nats.max-age-minutes=60
+app.nats.enabled=true
+```
+
+For production: use `storage=file` and increase `max-age-minutes`.
+
+### Actuator
+
+```properties
+server.port=8080
+management.endpoints.web.exposure.include=health,metrics
+management.endpoint.health.show-details=always
+```
+
+Endpoints:
+- `GET /actuator/health` — UP when CDC listener is running
+- `GET /actuator/metrics/cdc.events.total` — event count by type
+- `GET /actuator/metrics/cdc.nats.published` — NATS publish count
+
+---
+
+## Database setup
+
+### PostgreSQL
 
 ```sql
--- Check current level
-SHOW wal_level;
-
--- In postgresql.conf:
+-- postgresql.conf
 wal_level = logical
 max_replication_slots = 5
 max_wal_senders = 5
--- Then restart Postgres
 ```
 
-The library auto-creates the publication and replication slot on first run (`CREATE PUBLICATION ... FOR ALL TABLES`). Configurable:
-
-```properties
-app.cdc.slot-name=my_slot
-app.cdc.publication-name=my_publication
-app.cdc.create-slot-if-not-exists=true
-app.cdc.create-publication-if-not-exists=true
-```
-
-### REPLICA IDENTITY — controls what data appears in UPDATE/DELETE events
-
-This is per-table and must be set manually:
-
+For UPDATE/DELETE with full row data:
 ```sql
--- DEFAULT (Postgres default): UPDATE/DELETE only include primary key columns
--- Good enough if you only need to know *which row* changed
-ALTER TABLE orders REPLICA IDENTITY DEFAULT;
-
--- FULL: UPDATE/DELETE include all column values (old row for DELETE, old+new for UPDATE)
--- Required if consumers need the full deleted row or the before-image of an UPDATE
 ALTER TABLE orders REPLICA IDENTITY FULL;
 ```
 
-| Setting | INSERT | UPDATE | DELETE |
-|---|---|---|---|
-| `DEFAULT` | full row | new values only (no old values) | primary key only |
-| `FULL` | full row | old + new values | full deleted row |
+| REPLICA IDENTITY | INSERT | UPDATE | DELETE |
+|-----------------|--------|--------|--------|
+| `DEFAULT` | full row | new only | PK only |
+| `FULL` | full row | old + new | full row |
 
-Example — `REPLICA IDENTITY DEFAULT` (what you get without any setup):
-```json
-// DELETE only has primary key, other columns are null
-{"type":"DELETE","table":"orders","data":{"col_0":"2","col_1":null,"col_2":null,"col_3":null}}
-```
-
-Example — `REPLICA IDENTITY FULL`:
-```json
-// DELETE has the full row
-{"type":"DELETE","table":"orders","data":{"col_0":"2","col_1":"mouse","col_2":"5","col_3":"pending"}}
-// UPDATE has both old and new
-{"type":"UPDATE","table":"orders","data":{"old":{"col_0":"1","col_1":"keyboard","col_2":"2","col_3":"pending"},"new":{"col_0":"1","col_1":"keyboard","col_2":"1","col_3":"shipped"}}}
-```
-
-**Recommendation:** use `REPLICA IDENTITY FULL` for any table where consumers need the full row on DELETE, or need to diff old vs new on UPDATE.
-
-**What gets captured:** INSERT, UPDATE, DELETE on all tables in the publication. BEGIN/COMMIT are filtered out before publishing to NATS.
-
----
-
-## Postgres vs MySQL capability comparison
-
-| Capability | Postgres (WAL) | MySQL (binlog) |
-|---|---|---|
-| INSERT detection | ✅ full row | ✅ full row |
-| UPDATE detection | ✅ new only by default; old+new with `REPLICA IDENTITY FULL` | ✅ full old + new row |
-| DELETE detection | ✅ PK only by default; full row with `REPLICA IDENTITY FULL` | ✅ full deleted row |
-| Column names in data | ⚠ positional (`col_0`, `col_1`...) | ✅ real column names |
-| Latency | Real-time (WAL stream) | Real-time (binlog stream) |
-| DB setup required | `wal_level=logical` in server config | `log_bin=ROW`, `binlog_row_image=FULL` in server config |
-| Special table schema | None | None |
-
----
-
-## MySQL setup requirements
-
-MySQL CDC uses **binlog replication** — the same mechanism as Debezium. No special table schema is required.
-
-### Server configuration
+### MySQL
 
 ```ini
 # my.cnf
@@ -232,95 +343,43 @@ binlog_row_image = FULL
 server_id        = 1
 ```
 
-This is pre-configured in the provided `docker-compose.yml`. For an existing MySQL instance, add these to `my.cnf` and restart.
-
-### User privileges
-
-The connecting user needs replication privileges:
-
+User privileges:
 ```sql
 GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'user'@'%';
-FLUSH PRIVILEGES;
-```
-
-### Example
-
-```sql
-CREATE TABLE products (
-    id    INT AUTO_INCREMENT PRIMARY KEY,
-    name  VARCHAR(100),
-    price DECIMAL(10,2),
-    stock INT DEFAULT 0
-);
-
-INSERT INTO products (name, price, stock) VALUES ('laptop', 999.99, 10);
-INSERT INTO products (name, price, stock) VALUES ('phone', 499.50, 25);
-UPDATE products SET stock = 8, price = 949.99 WHERE name = 'laptop';
-DELETE FROM products WHERE name = 'phone';
-```
-
-Events emitted (MySQL uses **real column names**, unlike Postgres):
-```
-[CDC] type=INSERT schema=mydb table=products data={"id": 1, "name": "laptop", "price": 999.99, "stock": 10}
-[CDC] type=INSERT schema=mydb table=products data={"id": 2, "name": "phone", "price": 499.50, "stock": 25}
-[CDC] type=UPDATE schema=mydb table=products data={"old": {"id": 1, "name": "laptop", "price": 999.99, "stock": 10}, "new": {"id": 1, "name": "laptop", "price": 949.99, "stock": 8}}
-[CDC] type=DELETE schema=mydb table=products data={"id": 2, "name": "phone", "price": 499.50, "stock": 25}
-```
-
-Configure which tables to watch:
-
-```properties
-app.cdc.mysql.tables=orders,users    # empty = watch all tables
 ```
 
 ---
 
-## Configuration reference
+## CDCEvent types
 
-### Postgres
-
-```properties
-spring.datasource.url=jdbc:postgresql://localhost:5432/mydb
-spring.datasource.username=postgres
-spring.datasource.password=postgres
-
-app.cdc.enabled=true
-app.cdc.slot-name=cdc_slot
-app.cdc.publication-name=cdc_publication
-app.cdc.create-slot-if-not-exists=true
-app.cdc.create-publication-if-not-exists=true
-```
-
-### MySQL
-
-```properties
-spring.datasource.url=jdbc:mysql://localhost:3306/mydb
-spring.datasource.username=user
-spring.datasource.password=secret
-
-app.cdc.enabled=true
-app.cdc.mysql.tables=          # empty = watch all tables; comma-separated to filter
-```
-
-### NATS
-
-```properties
-app.nats.url=nats://localhost:4222
-app.nats.stream-name=CDC
-app.nats.subject-prefix=cdc
-app.nats.storage=memory        # memory | file
-app.nats.max-age-minutes=60
-app.nats.enabled=true
-```
-
-> For production use `storage=file` and increase `max-age-minutes` so consumers that are temporarily offline don't miss events.
+| Type | Description | Published to NATS? |
+|------|-------------|-------------------|
+| `INSERT` | Row inserted | Yes |
+| `UPDATE` | Row updated (old + new) | Yes |
+| `DELETE` | Row deleted | Yes |
+| `DDL` | Schema change (CREATE/ALTER/DROP) | Yes (to `_ddl` subject) |
+| `TRUNCATE` | Table truncated (Postgres only) | Yes |
+| `BEGIN` | Transaction start | No |
+| `COMMIT` | Transaction end (MySQL includes xid) | No |
+| `HEARTBEAT` | Idle keepalive (Postgres, every 30s) | No |
 
 ---
 
 ## Build & test
 
 ```bash
-mvn install        # builds all modules + runs all tests (requires Docker)
+mvn install    # builds all modules + runs all tests (requires Docker)
 ```
 
-Tests: 10 core + 8 postgres + 11 mysql + 5 nats = **34 tests**, all using Testcontainers (no manual setup needed).
+**69 tests** across all modules, all using Testcontainers:
+- 10 core unit tests
+- 18 Postgres integration tests (WAL, DDL, TRUNCATE, reconnect, type mapping, schema history)
+- 18 MySQL integration tests (binlog, DDL, BEGIN/COMMIT, type mapping)
+- 5 NATS integration tests
+- 18 E2E tests (full server + DB + NATS pipeline)
+
+---
+
+## License
+
+[Apache License 2.0](LICENSE)

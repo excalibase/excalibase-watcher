@@ -44,7 +44,7 @@
         <module>excalibase-watcher-postgres</module>
         <module>excalibase-watcher-mysql</module>
         <module>excalibase-watcher-nats</module>
-        <module>excalibase-watcher-sample</module>
+        <module>excalibase-watcher-api</module>
     </modules>
 
     <properties>
@@ -97,6 +97,17 @@
                 <groupId>io.debezium</groupId>
                 <artifactId>mysql-binlog-connector-java</artifactId>
                 <version>${mysql.binlog.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.excalibase</groupId>
+                <artifactId>excalibase-watcher-mysql</artifactId>
+                <version>${excalibase.watcher.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>mysql</artifactId>
+                <version>${testcontainers.version}</version>
+                <scope>test</scope>
             </dependency>
             <dependency>
                 <groupId>io.github.excalibase</groupId>

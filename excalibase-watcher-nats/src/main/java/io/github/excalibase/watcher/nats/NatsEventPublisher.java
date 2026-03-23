@@ -3,6 +3,8 @@ package io.github.excalibase.watcher.nats;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.excalibase.watcher.CDCEvent;
 import io.github.excalibase.watcher.CDCService;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.nats.client.Connection;
 import io.nats.client.JetStream;
 import io.nats.client.JetStreamManagement;
@@ -38,15 +40,18 @@ public class NatsEventPublisher {
     private final CDCService cdcService;
     private final NatsProperties props;
     private final ObjectMapper objectMapper;
+    private final MeterRegistry meterRegistry; // nullable
 
     private Connection connection;
     private JetStream jetStream;
     private Disposable subscription;
 
-    public NatsEventPublisher(CDCService cdcService, NatsProperties props, ObjectMapper objectMapper) {
+    public NatsEventPublisher(CDCService cdcService, NatsProperties props, ObjectMapper objectMapper,
+                              @org.springframework.beans.factory.annotation.Autowired(required = false) MeterRegistry meterRegistry) {
         this.cdcService = cdcService;
         this.props = props;
         this.objectMapper = objectMapper;
+        this.meterRegistry = meterRegistry;
     }
 
     @PostConstruct
@@ -73,7 +78,9 @@ public class NatsEventPublisher {
         subscription = cdcService.getAllEventsFlux()
                 .filter(e -> e.getType() == CDCEvent.Type.INSERT
                           || e.getType() == CDCEvent.Type.UPDATE
-                          || e.getType() == CDCEvent.Type.DELETE)
+                          || e.getType() == CDCEvent.Type.DELETE
+                          || e.getType() == CDCEvent.Type.DDL
+                          || e.getType() == CDCEvent.Type.TRUNCATE)
                 .subscribe(
                         this::publish,
                         err -> log.error("Error in CDC→NATS pipeline", err)
@@ -105,8 +112,17 @@ public class NatsEventPublisher {
             String subject = buildSubject(event);
             byte[] payload = objectMapper.writeValueAsBytes(event);
             jetStream.publish(subject, payload);
+            if (meterRegistry != null) {
+                Counter.builder("cdc.nats.published")
+                        .tag("type", event.getType().name())
+                        .register(meterRegistry)
+                        .increment();
+            }
             log.debug("Published CDC event to NATS subject '{}': type={}", subject, event.getType());
         } catch (Exception e) {
+            if (meterRegistry != null) {
+                Counter.builder("cdc.nats.errors").register(meterRegistry).increment();
+            }
             log.error("Failed to publish CDC event to NATS: table={}, type={}",
                     event.getTable(), event.getType(), e);
         }
@@ -114,7 +130,8 @@ public class NatsEventPublisher {
 
     private String buildSubject(CDCEvent event) {
         String schema = event.getSchema() != null ? event.getSchema() : "default";
-        return props.getSubjectPrefix() + "." + schema + "." + event.getTable();
+        String table = event.getTable() != null ? event.getTable() : "_ddl";
+        return props.getSubjectPrefix() + "." + schema + "." + table;
     }
 
     /**

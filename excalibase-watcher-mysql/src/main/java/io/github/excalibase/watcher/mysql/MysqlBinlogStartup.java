@@ -17,6 +17,9 @@
 package io.github.excalibase.watcher.mysql;
 
 import io.github.excalibase.watcher.CDCService;
+import io.github.excalibase.watcher.mysql.snapshot.BinlogOffsetStore;
+import io.github.excalibase.watcher.mysql.snapshot.FileBinlogOffsetStore;
+import io.github.excalibase.watcher.snapshot.SnapshotMode;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -25,6 +28,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 
@@ -41,7 +45,10 @@ import java.util.List;
  * app.cdc.enabled=true
  *
  * # Optional
- * app.cdc.mysql.tables=users,orders   # empty = watch all tables
+ * app.cdc.mysql.tables=users,orders               # empty = watch all tables
+ * app.cdc.mysql.snapshot-mode=NONE                # NONE | CHUNKED
+ * app.cdc.mysql.snapshot-chunk-size=10000
+ * app.cdc.mysql.offset-store.file=/var/lib/myapp/binlog.offset  # persist binlog offset
  * }</pre>
  *
  * <p>MySQL server must have binlog enabled:</p>
@@ -60,20 +67,29 @@ public class MysqlBinlogStartup {
     @Autowired
     private CDCService cdcService;
 
-    @Value("${spring.datasource.url}")
+    @Value("${app.cdc.mysql.url:${spring.datasource.url}}")
     private String jdbcUrl;
 
-    @Value("${spring.datasource.username}")
+    @Value("${app.cdc.mysql.username:${spring.datasource.username}}")
     private String username;
 
-    @Value("${spring.datasource.password}")
+    @Value("${app.cdc.mysql.password:${spring.datasource.password}}")
     private String password;
 
-    @Value("${app.cdc.enabled:true}")
+    @Value("${app.cdc.mysql.enabled:${app.cdc.enabled:true}}")
     private boolean cdcEnabled;
 
     @Value("${app.cdc.mysql.tables:}")
     private String tablesConfig;
+
+    @Value("${app.cdc.mysql.snapshot-mode:NONE}")
+    private String snapshotModeConfig;
+
+    @Value("${app.cdc.mysql.snapshot-chunk-size:10000}")
+    private int snapshotChunkSize;
+
+    @Value("${app.cdc.mysql.offset-store.file:}")
+    private String offsetStoreFile;
 
     private MysqlBinlogListener binlogListener;
 
@@ -91,10 +107,21 @@ public class MysqlBinlogStartup {
                         .filter(s -> !s.isBlank())
                         .toList();
 
+        SnapshotMode snapshotMode = SnapshotMode.valueOf(snapshotModeConfig.trim().toUpperCase());
+
+        BinlogOffsetStore offsetStore = null;
+        if (!offsetStoreFile.isBlank()) {
+            offsetStore = new FileBinlogOffsetStore(Path.of(offsetStoreFile));
+            log.info("MySQL binlog offset store: {}", offsetStoreFile);
+        }
+
         binlogListener = new MysqlBinlogListener.Builder()
                 .jdbcUrl(jdbcUrl)
                 .credentials(username, password)
                 .tables(tables)
+                .snapshotMode(snapshotMode)
+                .snapshotChunkSize(snapshotChunkSize)
+                .offsetStore(offsetStore)
                 .eventHandler(cdcService::handleCDCEvent)
                 .build();
 
