@@ -149,9 +149,6 @@ public class MysqlBinlogListener {
             throw new IllegalStateException("MySQL binlog listener is already running");
         }
 
-        log.info("Starting MySQL binlog listener — schema: {}, tables: {}",
-                schema, tableFilter.isEmpty() ? "ALL" : tableFilter);
-
         metadataConnection = DriverManager.getConnection(jdbcUrl, username, password);
 
         String[] hostPort = parseHostPort(jdbcUrl);
@@ -163,22 +160,18 @@ public class MysqlBinlogListener {
 
         // Snapshot phase (if configured) — runs before CDC starts
         if (snapshotMode == SnapshotMode.CHUNKED) {
-            log.info("Running chunked snapshot before starting CDC...");
             BinlogPosition snapshotPos = MysqlChunkedSnapshot.run(
                     jdbcUrl, username, password, schema, tableFilter, snapshotChunkSize, eventHandler);
             binlogClient.setBinlogFilename(snapshotPos.file());
             binlogClient.setBinlogPosition(snapshotPos.position());
-            log.info("Snapshot complete, CDC starting from {}", snapshotPos.asString());
         } else if (snapshotMode == SnapshotMode.BACKUP_FILE) {
             if (snapshotBackupFile == null) {
                 throw new IllegalStateException("BACKUP_FILE snapshot mode requires snapshotBackupFile to be set");
             }
-            log.info("Loading snapshot from backup file: {}", snapshotBackupFile);
             try {
                 BinlogPosition snapshotPos = MysqlDumpSnapshot.run(snapshotBackupFile, schema, eventHandler);
                 binlogClient.setBinlogFilename(snapshotPos.file());
                 binlogClient.setBinlogPosition(snapshotPos.position());
-                log.info("Dump snapshot complete, CDC starting from {}", snapshotPos.asString());
             } catch (java.io.IOException e) {
                 throw new IllegalStateException("Failed to load backup file: " + snapshotBackupFile, e);
             }
@@ -190,7 +183,7 @@ public class MysqlBinlogListener {
                     BinlogPosition pos = savedPos.get();
                     binlogClient.setBinlogFilename(pos.file());
                     binlogClient.setBinlogPosition(pos.position());
-                    log.info("Resuming from persisted binlog offset: {}", pos.asString());
+                    log.debug("Resuming from persisted binlog offset: {}", pos.asString());
                 } else {
                     positionAtCurrentOffset();
                 }
@@ -203,7 +196,7 @@ public class MysqlBinlogListener {
         binlogClient.registerLifecycleListener(new BinaryLogClient.AbstractLifecycleListener() {
             @Override
             public void onConnect(BinaryLogClient client) {
-                log.info("MySQL binlog connected — {}:{}", host, port);
+                log.debug("MySQL binlog connected — {}:{}", host, port);
             }
 
             @Override
@@ -236,12 +229,11 @@ public class MysqlBinlogListener {
                 }
             }
             running.set(false);
-            log.info("MySQL binlog listener thread exited");
         }, "mysql-binlog-listener");
         binlogThread.setDaemon(false);
         binlogThread.start();
 
-        log.info("MySQL binlog listener started successfully");
+        log.info("MySQL binlog listener started");
     }
 
     /**
@@ -250,7 +242,6 @@ public class MysqlBinlogListener {
     public void stop() {
         if (!running.get()) return;
 
-        log.info("Stopping MySQL binlog listener...");
         running.set(false);
 
         try {
@@ -415,7 +406,7 @@ public class MysqlBinlogListener {
                 long position = rs.getLong("Position");
                 binlogClient.setBinlogFilename(file);
                 binlogClient.setBinlogPosition(position);
-                log.info("Binlog start position: {}:{}", file, position);
+                log.debug("Binlog start position: {}:{}", file, position);
             }
         }
     }

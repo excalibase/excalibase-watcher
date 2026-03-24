@@ -66,7 +66,7 @@ public class NatsEventPublisher {
                 .reconnectWait(Duration.ofSeconds(2))
                 .maxReconnects(-1)          // retry forever
                 .connectionListener((conn, type) ->
-                        log.info("NATS connection event: {}", type))
+                        log.debug("NATS connection event: {}", type))
                 .build();
 
         connection = Nats.connect(options);
@@ -86,8 +86,7 @@ public class NatsEventPublisher {
                         err -> log.error("Error in CDC→NATS pipeline", err)
                 );
 
-        log.info("NATS JetStream publisher started — stream='{}', url='{}'",
-                props.getStreamName(), props.getUrl());
+        log.info("NATS JetStream publisher started");
     }
 
     @PreDestroy
@@ -155,12 +154,9 @@ public class NatsEventPublisher {
         try {
             jsm.getStreamInfo(props.getStreamName());
             jsm.updateStream(config);
-            log.info("NATS JetStream stream '{}' updated", props.getStreamName());
         } catch (io.nats.client.JetStreamApiException e) {
             if (e.getErrorCode() == 404) {
                 jsm.addStream(config);
-                log.info("NATS JetStream stream '{}' created (storage={}, maxAge={}min)",
-                        props.getStreamName(), storageType, props.getMaxAgeMinutes());
             } else {
                 throw e;
             }

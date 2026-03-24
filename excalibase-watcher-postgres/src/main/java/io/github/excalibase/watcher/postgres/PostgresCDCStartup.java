@@ -137,7 +137,7 @@ public class PostgresCDCStartup {
         try {
             cdcListener.start();
             cdcService.markRunning();
-            log.info("PostgreSQL CDC listener started and wired to CDCService");
+            log.info("PostgreSQL CDC listener started");
         } catch (Exception e) {
             log.error("Failed to start PostgreSQL CDC listener", e);
         }

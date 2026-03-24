@@ -65,7 +65,7 @@ public class MysqlChunkedSnapshot {
                                      Consumer<CDCEvent> eventHandler) throws SQLException {
         try (Connection conn = DriverManager.getConnection(jdbcUrl, username, password)) {
             BinlogPosition position = captureBinlogPosition(conn);
-            log.info("Snapshot binlog position locked at: {}", position.asString());
+            log.debug("Snapshot binlog position locked at: {}", position.asString());
 
             List<String> tablesToSnapshot = tables.isEmpty()
                     ? fetchAllTables(conn, schema)
@@ -75,7 +75,7 @@ public class MysqlChunkedSnapshot {
                 snapshotTable(conn, schema, table, chunkSize, position, eventHandler);
             }
 
-            log.info("Snapshot complete — {} tables", tablesToSnapshot.size());
+            log.debug("Snapshot complete — {} tables", tablesToSnapshot.size());
             return position;
         }
     }
@@ -110,7 +110,7 @@ public class MysqlChunkedSnapshot {
         List<String> columns = fetchColumnNames(conn, schema, table);
         String pkCol = fetchPrimaryKey(conn, schema, table);
 
-        log.info("Snapshotting {}.{} (pk={}, columns={})", schema, table, pkCol, columns.size());
+        log.debug("Snapshotting {}.{} (pk={}, columns={})", schema, table, pkCol, columns.size());
         long rowCount = 0;
 
         conn.setAutoCommit(false);
@@ -124,7 +124,7 @@ public class MysqlChunkedSnapshot {
             conn.setAutoCommit(true);
         }
 
-        log.info("Snapshot complete for {}.{}: {} rows", schema, table, rowCount);
+        log.debug("Snapshot complete for {}.{}: {} rows", schema, table, rowCount);
     }
 
     private static long snapshotByPk(Connection conn, String schema, String table,

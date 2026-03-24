@@ -60,7 +60,7 @@ public class FileBinlogOffsetStore implements BinlogOffsetStore {
         }
         String file = content.substring(0, colon);
         long position = Long.parseLong(content.substring(colon + 1));
-        log.info("Loaded binlog offset: {}:{}", file, position);
+        log.debug("Loaded binlog offset: {}:{}", file, position);
         return Optional.of(new BinlogPosition(file, position));
     }
 

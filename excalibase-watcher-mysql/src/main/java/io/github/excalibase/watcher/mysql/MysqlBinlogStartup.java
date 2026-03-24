@@ -112,7 +112,6 @@ public class MysqlBinlogStartup {
         BinlogOffsetStore offsetStore = null;
         if (!offsetStoreFile.isBlank()) {
             offsetStore = new FileBinlogOffsetStore(Path.of(offsetStoreFile));
-            log.info("MySQL binlog offset store: {}", offsetStoreFile);
         }
 
         binlogListener = new MysqlBinlogListener.Builder()
@@ -128,7 +127,7 @@ public class MysqlBinlogStartup {
         try {
             binlogListener.start();
             cdcService.markRunning();
-            log.info("MySQL binlog listener started and wired to CDCService");
+            log.info("MySQL binlog listener started");
         } catch (Exception e) {
             log.error("Failed to start MySQL binlog listener", e);
         }

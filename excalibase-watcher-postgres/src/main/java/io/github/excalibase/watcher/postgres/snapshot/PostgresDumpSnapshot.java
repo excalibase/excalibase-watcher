@@ -89,7 +89,6 @@ public class PostgresDumpSnapshot {
                 List<String> columns = parseColumns(m.group(3));
                 tableCount++;
 
-                log.info("Loading table {}.{} ({} columns) from dump", schema, table, columns.size());
                 int tableRows = 0;
 
                 while ((line = reader.readLine()) != null) {
@@ -102,11 +101,11 @@ public class PostgresDumpSnapshot {
                     rowCount++;
                 }
 
-                log.info("Loaded {} rows for {}.{}", tableRows, schema, table);
+                log.debug("Loaded {} rows for {}.{}", tableRows, schema, table);
             }
         }
 
-        log.info("Dump snapshot complete: {} rows from {} tables", rowCount, tableCount);
+        log.debug("Dump snapshot complete: {} rows from {} tables", rowCount, tableCount);
     }
 
     // -------------------------------------------------------------------------

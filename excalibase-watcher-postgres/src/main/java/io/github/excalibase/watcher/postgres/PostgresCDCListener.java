@@ -128,25 +128,19 @@ public class PostgresCDCListener {
             throw new IllegalStateException("CDC Listener is already running");
         }
 
-        logger.info("Starting PostgreSQL CDC Listener...");
-
         connect();
 
         // Snapshot phase — slot is already created above so WAL is captured during snapshot
         if (snapshotMode == SnapshotMode.CHUNKED) {
-            logger.info("Running Postgres chunked snapshot before starting CDC...");
             String schema = parseSchema(jdbcUrl);
             PostgresChunkedSnapshot.run(jdbcUrl, username, password,
                     schema, tableFilter, snapshotChunkSize, eventHandler);
-            logger.info("Postgres snapshot complete");
         } else if (snapshotMode == SnapshotMode.BACKUP_FILE) {
             if (snapshotBackupFile == null) {
                 throw new IllegalStateException("BACKUP_FILE snapshot mode requires snapshotBackupFile to be set");
             }
-            logger.info("Loading Postgres snapshot from backup file: {}", snapshotBackupFile);
             try {
                 PostgresDumpSnapshot.run(snapshotBackupFile, snapshotStartLsn, eventHandler);
-                logger.info("Postgres dump snapshot complete");
             } catch (java.io.IOException e) {
                 throw new IllegalStateException("Failed to load backup file: " + snapshotBackupFile, e);
             }
@@ -154,7 +148,7 @@ public class PostgresCDCListener {
 
         running.set(true);
         lastMessageTime = System.currentTimeMillis();
-        logger.info("CDC Listener started successfully");
+        logger.info("PostgreSQL CDC Listener started");
 
         Thread listenerThread = new Thread(this::listen);
         listenerThread.setDaemon(false);
@@ -209,7 +203,6 @@ public class PostgresCDCListener {
             return;
         }
 
-        logger.info("Stopping PostgreSQL CDC Listener...");
         running.set(false);
 
         try {
@@ -223,11 +216,10 @@ public class PostgresCDCListener {
             logger.error("Error stopping CDC listener", e);
         }
 
-        logger.info("CDC Listener stopped");
+        logger.info("PostgreSQL CDC Listener stopped");
     }
 
     private void listen() {
-        logger.info("Starting to listen for CDC events...");
         int reconnectAttempt = 0;
 
         while (running.get()) {
@@ -275,7 +267,7 @@ public class PostgresCDCListener {
                     Thread.sleep(delayMs);
                     if (!running.get()) break;
                     connect();
-                    logger.info("Reconnected successfully after attempt {}", reconnectAttempt);
+                    logger.debug("Reconnected successfully after attempt {}", reconnectAttempt);
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     break;
@@ -291,7 +283,6 @@ public class PostgresCDCListener {
         }
 
         running.set(false);
-        logger.info("CDC listener thread terminated");
     }
 
     // -------------------------------------------------------------------------
@@ -307,7 +298,7 @@ public class PostgresCDCListener {
                     try (Statement stmt = connection.createStatement()) {
                         stmt.execute("CREATE PUBLICATION " + validateIdentifier(publicationName) + " FOR ALL TABLES");
                     }
-                    logger.info("Created publication: {}", publicationName);
+                    logger.debug("Created publication: {}", publicationName);
                 }
             }
         }
@@ -324,7 +315,7 @@ public class PostgresCDCListener {
                         create.setString(1, slotName);
                         create.execute();
                     }
-                    logger.info("Created replication slot: {}", slotName);
+                    logger.debug("Created replication slot: {}", slotName);
                 }
             }
         }
@@ -355,7 +346,7 @@ public class PostgresCDCListener {
 
             try {
                 stmt.execute("CREATE EVENT TRIGGER cdc_ddl_capture ON ddl_command_end EXECUTE FUNCTION _cdc_ddl_log_fn()");
-                logger.info("Created DDL capture event trigger");
+                logger.debug("Created DDL capture event trigger");
             } catch (SQLException e) {
                 if (!"42710".equals(e.getSQLState())) throw e;
             }
@@ -373,7 +364,7 @@ public class PostgresCDCListener {
                           END LOOP;
                         END;$$""".formatted(DDL_LOG_TABLE));
                 stmt.execute("CREATE EVENT TRIGGER cdc_ddl_drop_capture ON sql_drop EXECUTE FUNCTION _cdc_ddl_drop_fn()");
-                logger.info("Created DDL drop capture event trigger");
+                logger.debug("Created DDL drop capture event trigger");
             } catch (SQLException e) {
                 if (!"42710".equals(e.getSQLState())) throw e;
             }

@@ -68,14 +68,9 @@ public class PostgresChunkedSnapshot {
                     ? fetchAllTables(conn, schema)
                     : new ArrayList<>(tables);
 
-            log.info("Starting Postgres chunked snapshot: {} tables in schema '{}'",
-                    tablesToSnapshot.size(), schema);
-
             for (String table : tablesToSnapshot) {
                 snapshotTable(conn, schema, table, chunkSize, eventHandler);
             }
-
-            log.info("Postgres snapshot complete — {} tables", tablesToSnapshot.size());
         }
     }
 
@@ -97,7 +92,6 @@ public class PostgresChunkedSnapshot {
         List<String> columns = fetchColumnNames(conn, schema, table);
         String pkCol = fetchPrimaryKey(conn, schema, table);
 
-        log.info("Snapshotting {}.{} (pk={}, columns={})", schema, table, pkCol, columns.size());
         long rowCount = 0;
 
         conn.setAutoCommit(false);
@@ -111,7 +105,7 @@ public class PostgresChunkedSnapshot {
             conn.setAutoCommit(true);
         }
 
-        log.info("Snapshot complete for {}.{}: {} rows", schema, table, rowCount);
+        log.debug("Snapshot complete for {}.{}: {} rows", schema, table, rowCount);
     }
 
     private static long snapshotByPk(Connection conn, String schema, String table,

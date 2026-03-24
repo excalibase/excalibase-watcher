@@ -91,7 +91,7 @@ public class MysqlDumpSnapshot {
                     Matcher m = BINLOG_POS_PATTERN.matcher(line);
                     if (m.find()) {
                         position = new BinlogPosition(m.group(1), Long.parseLong(m.group(2)));
-                        log.info("Parsed binlog position from dump: {}", position.asString());
+                        log.debug("Parsed binlog position from dump: {}", position.asString());
                     }
                     continue;
                 }
@@ -121,7 +121,7 @@ public class MysqlDumpSnapshot {
                     "Ensure the dump was created with --master-data=2.");
         }
 
-        log.info("Dump snapshot complete: {} rows loaded, position {}", rowCount, position.asString());
+        log.debug("Dump snapshot complete: {} rows loaded, position {}", rowCount, position.asString());
         return position;
     }
 
