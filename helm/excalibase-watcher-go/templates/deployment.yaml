@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "excalibase-watcher-go.fullname" . }}
+  labels:
+    {{- include "excalibase-watcher-go.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "excalibase-watcher-go.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "excalibase-watcher-go.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "excalibase-watcher-go.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --config
+            - /etc/watcher/config.yaml
+          ports:
+            - name: http
+              containerPort: {{ .Values.health.port }}
+              protocol: TCP
+          env:
+            {{- /* Secrets injected as env vars — Viper BindEnv picks them up */}}
+            {{- if .Values.postgres.enabled }}
+            - name: WATCHER_POSTGRES_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "excalibase-watcher-go.postgresSecretName" . }}
+                  key: {{ .Values.postgres.existingSecretUsernameKey }}
+            - name: WATCHER_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "excalibase-watcher-go.postgresSecretName" . }}
+                  key: {{ .Values.postgres.existingSecretPasswordKey }}
+            {{- end }}
+            {{- if .Values.mysql.enabled }}
+            - name: WATCHER_MYSQL_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "excalibase-watcher-go.mysqlSecretName" . }}
+                  key: {{ .Values.mysql.existingSecretUsernameKey }}
+            - name: WATCHER_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "excalibase-watcher-go.mysqlSecretName" . }}
+                  key: {{ .Values.mysql.existingSecretPasswordKey }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/watcher
+              readOnly: true
+            {{- if and .Values.mysql.enabled .Values.mysql.persistence.enabled }}
+            - name: mysql-offset
+              mountPath: /data
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "excalibase-watcher-go.fullname" . }}
+        {{- if and .Values.mysql.enabled .Values.mysql.persistence.enabled }}
+        - name: mysql-offset
+          persistentVolumeClaim:
+            claimName: {{ .Values.mysql.persistence.existingClaim | default (printf "%s-mysql-offset" (include "excalibase-watcher-go.fullname" .)) }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

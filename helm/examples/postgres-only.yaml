@@ -1,0 +1,23 @@
+# Example: Watch PostgreSQL only
+# helm install watcher helm/excalibase-watcher-go/ -f helm/examples/postgres-only.yaml
+
+postgres:
+  enabled: true
+  url: "postgres://postgres-service:5432/mydb?replication=database"
+  # Use existingSecret in production:
+  # existingSecret: "my-pg-secret"
+  username: "postgres"
+  password: "changeme"
+  slotName: "watcher_slot"
+  publicationName: "watcher_pub"
+  captureDdl: true
+
+mysql:
+  enabled: false
+
+nats:
+  url: "nats://nats-service:4222"
+  streamName: "CDC"
+  subjectPrefix: "cdc"
+  storage: "file"
+  maxAgeMinutes: 1440

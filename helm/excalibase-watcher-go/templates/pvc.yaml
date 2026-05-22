@@ -1,0 +1,17 @@
+{{- if and .Values.mysql.enabled .Values.mysql.persistence.enabled (not .Values.mysql.persistence.existingClaim) -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ printf "%s-mysql-offset" (include "excalibase-watcher-go.fullname" .) }}
+  labels:
+    {{- include "excalibase-watcher-go.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.mysql.persistence.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.mysql.persistence.size }}
+  {{- if .Values.mysql.persistence.storageClass }}
+  storageClassName: {{ .Values.mysql.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

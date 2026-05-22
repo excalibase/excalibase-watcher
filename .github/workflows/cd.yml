@@ -8,46 +8,17 @@ on:
     branches: [ main ]
 
 env:
-  DOCKER_IMAGE: excalibase/excalibase-watcher
+  DOCKER_IMAGE: excalibase/excalibase-watcher-go
 
 jobs:
   docker:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event.workflow_run.conclusion == 'success')
+    if: github.event.workflow_run.conclusion == 'success'
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
-    - name: Set up JDK 21 (if building from scratch)
-      if: github.event_name == 'push'
-      uses: actions/setup-java@v4
-      with:
-        java-version: '21'
-        distribution: 'corretto'
-
-    - name: Cache Maven dependencies (if building from scratch)
-      if: github.event_name == 'push'
-      uses: actions/cache@v4
-      with:
-        path: ~/.m2/repository
-        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-        restore-keys: |
-          ${{ runner.os }}-maven-
-
-    - name: Download JAR artifacts (if from workflow_run)
-      if: github.event_name == 'workflow_run'
-      uses: actions/download-artifact@v4
-      with:
-        name: jar-artifacts
-        path: excalibase-watcher-api/target/
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        run-id: ${{ github.event.workflow_run.id }}
-
-    - name: Build JAR (if not from workflow_run)
-      if: github.event_name == 'push'
-      run: mvn package -DskipTests --batch-mode
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3

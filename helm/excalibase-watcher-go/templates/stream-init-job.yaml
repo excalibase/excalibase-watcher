@@ -1,0 +1,40 @@
+{{- if and .Values.nats.enabled .Values.nats.streamInit.enabled -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-stream-init" (include "excalibase-watcher-go.fullname" .) }}
+  labels:
+    {{- include "excalibase-watcher-go.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "excalibase-watcher-go.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: stream-init
+          image: {{ .Values.nats.streamInit.image | quote }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              # Idempotent: `nats stream add` fails if the stream exists, which we ignore.
+              # This preserves whatever topology is already provisioned by infra.
+              nats --server={{ .Values.nats.url }} stream add {{ .Values.nats.streamName }} \
+                --subjects='{{ .Values.nats.streamInit.subjects }}' \
+                --storage={{ .Values.nats.storage }} \
+                --retention=limits \
+                --max-age={{ .Values.nats.maxAgeMinutes }}m \
+                --discard={{ .Values.nats.streamInit.discard }} \
+                --replicas={{ .Values.nats.streamInit.replicas }} \
+                --max-msgs=-1 --max-bytes=-1 --max-msg-size=-1 \
+                --dupe-window=2m \
+                --defaults \
+                || echo "stream {{ .Values.nats.streamName }} already exists, leaving it unchanged"
+{{- end }}

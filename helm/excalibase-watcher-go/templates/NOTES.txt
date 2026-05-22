@@ -1,0 +1,35 @@
+Excalibase Watcher (Go) has been deployed!
+
+IMPORTANT: The watcher does NOT create or modify NATS streams. The stream
+must be pre-provisioned with a wildcard subject pattern before any watcher
+starts. Recommended one-time setup:
+
+  nats stream add {{ .Values.nats.streamName }} \
+    --subjects='{{ .Values.nats.subjectPrefix }}.>' \
+    --storage=file --retention=limits \
+    --max-age={{ .Values.nats.maxAgeMinutes }}m --discard=old \
+    --replicas=3 --defaults
+
+For multi-tenant deployments, the stream uses a wildcard that covers all
+tenants (e.g. subjects=['cdc.>']). Each tenant's watcher uses a unique
+subject_prefix that falls under the wildcard (e.g. 'cdc.tenant-a',
+'cdc.tenant-b') — no topology changes per tenant.
+
+1. Check pod health:
+  kubectl get pods --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "excalibase-watcher-go.name" . }}"
+
+2. View logs:
+  kubectl logs --namespace {{ .Release.Namespace }} -l "app.kubernetes.io/name={{ include "excalibase-watcher-go.name" . }}" -f
+
+3. Check CDC health:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "excalibase-watcher-go.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://localhost:{{ .Values.service.port }}/healthz
+  curl http://localhost:{{ .Values.service.port }}/readyz
+
+4. View Prometheus metrics:
+  curl http://localhost:{{ .Values.service.port }}/metrics
+
+CDC events published to NATS JetStream:
+  Stream:  {{ .Values.nats.streamName }}
+  Subject: {{ .Values.nats.subjectPrefix }}.{schema}.{table}
+  URL:     {{ .Values.nats.url }}

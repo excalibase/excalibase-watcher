@@ -1,0 +1,207 @@
+# Default values for excalibase-watcher-go
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/excalibase/watcher
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  fsGroup: 65534
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# ---------------------------------------------------------------------------
+# PostgreSQL CDC
+# ---------------------------------------------------------------------------
+postgres:
+  enabled: true
+
+  # Connection URL (Postgres libpq format, not JDBC)
+  url: ""
+
+  # Inline credentials (use existingSecret in production)
+  username: ""
+  password: ""
+
+  # Reference an existing Secret instead of inline credentials
+  existingSecret: ""
+  existingSecretUsernameKey: "postgres-username"
+  existingSecretPasswordKey: "postgres-password"
+
+  # Replication
+  slotName: "cdc_slot"
+  publicationName: "cdc_publication"
+  createSlot: true
+  createPublication: true
+
+  # Table filtering (list, empty = all tables)
+  tables: []
+
+  # DDL capture via event triggers
+  captureDdl: false
+
+  # Snapshot
+  snapshotMode: "none"          # none | chunked | backup_file
+  snapshotChunkSize: 10000
+
+  # Schema history directory (empty = disabled)
+  schemaHistoryDir: ""
+
+# ---------------------------------------------------------------------------
+# MySQL CDC
+# ---------------------------------------------------------------------------
+mysql:
+  enabled: false
+
+  # Connection host:port
+  host: ""
+
+  # Inline credentials (use existingSecret in production)
+  username: ""
+  password: ""
+
+  # Reference an existing Secret instead of inline credentials
+  existingSecret: ""
+  existingSecretUsernameKey: "mysql-username"
+  existingSecretPasswordKey: "mysql-password"
+
+  # Database schema
+  schema: ""
+
+  # Table filtering (list, empty = all tables)
+  tables: []
+
+  # Snapshot
+  snapshotMode: "none"          # none | chunked | backup_file
+  snapshotChunkSize: 10000
+
+  # Offset persistence file path (default: /data/binlog.offset)
+  # Critical: if empty, restart replays binlog from current position and may lose events.
+  offsetFile: "/data/binlog.offset"
+
+  # Persistent volume for offset storage (strongly recommended in production)
+  persistence:
+    enabled: true
+    # existingClaim: ""        # use existing PVC instead of creating one
+    storageClass: ""           # empty = use cluster default
+    size: 1Gi
+    accessMode: ReadWriteOnce
+
+# ---------------------------------------------------------------------------
+# NATS JetStream
+# ---------------------------------------------------------------------------
+nats:
+  enabled: true
+  url: "nats://nats:4222"
+  streamName: "CDC"
+  subjectPrefix: "cdc"
+  storage: "memory"             # memory | file
+  maxAgeMinutes: 60
+
+  # Stream provisioning. The watcher is a pure publisher — it will NEVER
+  # create or modify the stream. Infra must provision it before the watcher
+  # starts. Options:
+  #
+  #   1. Let this chart run a one-shot Job before install (streamInit.enabled=true)
+  #   2. Provision out-of-band (terraform jetstream_stream, manual `nats` CLI, etc.)
+  #
+  # For multi-tenant setups sharing one stream, pick option 2 and use a
+  # wildcard pattern (subjects=['cdc.>']). Each tenant watcher then uses a
+  # unique subjectPrefix (e.g. 'cdc.tenant-a') that falls under the wildcard.
+  streamInit:
+    enabled: false
+    image: "natsio/nats-box:latest"
+    subjects: "cdc.>"               # wildcard — covers every subject prefix
+    discard: "old"
+    replicas: 1
+
+# ---------------------------------------------------------------------------
+# Health / Metrics
+# ---------------------------------------------------------------------------
+health:
+  port: 8080
+  bindAddress: "0.0.0.0"       # 0.0.0.0 in k8s for probes to work
+
+metrics:
+  enabled: true
+
+# ---------------------------------------------------------------------------
+# Resources (Go binary needs far less than JVM)
+# ---------------------------------------------------------------------------
+resources:
+  limits:
+    cpu: 200m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 32Mi
+
+# ---------------------------------------------------------------------------
+# Autoscaling
+# ---------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+
+# ---------------------------------------------------------------------------
+# Probes
+# ---------------------------------------------------------------------------
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  failureThreshold: 3
+
+# ---------------------------------------------------------------------------
+# Extra env vars, volumes
+# ---------------------------------------------------------------------------
+extraEnv: []
+# - name: WATCHER_POSTGRES_PASSWORD
+#   valueFrom:
+#     secretKeyRef:
+#       name: my-secret
+#       key: pg-password
+
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

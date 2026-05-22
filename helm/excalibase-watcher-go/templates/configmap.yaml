@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "excalibase-watcher-go.fullname" . }}
+  labels:
+    {{- include "excalibase-watcher-go.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    postgres:
+      enabled: {{ .Values.postgres.enabled }}
+      url: {{ .Values.postgres.url | quote }}
+      username: ""
+      password: ""
+      slot_name: {{ .Values.postgres.slotName | quote }}
+      publication_name: {{ .Values.postgres.publicationName | quote }}
+      create_slot: {{ .Values.postgres.createSlot }}
+      create_publication: {{ .Values.postgres.createPublication }}
+      tables:
+      {{- range .Values.postgres.tables }}
+        - {{ . | quote }}
+      {{- end }}
+      snapshot_mode: {{ .Values.postgres.snapshotMode | quote }}
+      snapshot_chunk_size: {{ .Values.postgres.snapshotChunkSize }}
+      capture_ddl: {{ .Values.postgres.captureDdl }}
+      {{- if .Values.postgres.schemaHistoryDir }}
+      schema_history_dir: {{ .Values.postgres.schemaHistoryDir | quote }}
+      {{- end }}
+
+    mysql:
+      enabled: {{ .Values.mysql.enabled }}
+      host: {{ .Values.mysql.host | quote }}
+      username: ""
+      password: ""
+      schema: {{ .Values.mysql.schema | quote }}
+      tables:
+      {{- range .Values.mysql.tables }}
+        - {{ . | quote }}
+      {{- end }}
+      snapshot_mode: {{ .Values.mysql.snapshotMode | quote }}
+      snapshot_chunk_size: {{ .Values.mysql.snapshotChunkSize }}
+      {{- if .Values.mysql.offsetFile }}
+      offset_file: {{ .Values.mysql.offsetFile | quote }}
+      {{- end }}
+
+    nats:
+      enabled: {{ .Values.nats.enabled }}
+      url: {{ .Values.nats.url | quote }}
+      stream_name: {{ .Values.nats.streamName | quote }}
+      subject_prefix: {{ .Values.nats.subjectPrefix | quote }}
+      max_age_minutes: {{ .Values.nats.maxAgeMinutes }}
+      storage: {{ .Values.nats.storage | quote }}
+
+    health:
+      port: {{ .Values.health.port }}
+      bind_address: {{ .Values.health.bindAddress | quote }}
+
+    metrics:
+      enabled: {{ .Values.metrics.enabled }}

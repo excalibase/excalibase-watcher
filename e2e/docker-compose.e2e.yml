@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16
+    ports:
+      - "15432:5432"
+    environment:
+      POSTGRES_DB: e2edb
+      POSTGRES_USER: e2euser
+      POSTGRES_PASSWORD: e2epass
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=20
+      - -c
+      - max_wal_senders=5
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2euser -d e2edb"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "13306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: e2epass
+      MYSQL_DATABASE: e2edb
+    command:
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --server-id=1
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=$$MYSQL_ROOT_PASSWORD mysqladmin ping -h localhost -u root"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+
+  nats:
+    image: nats:2.10
+    ports:
+      - "14222:4222"
+      - "18222:8222"
+    command:
+      - -js
+      - -m
+      - "8222"

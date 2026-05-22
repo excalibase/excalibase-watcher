@@ -1,0 +1,47 @@
+# excalibase-watcher configuration
+# Secrets should be set via environment variables:
+#   WATCHER_POSTGRES_PASSWORD, WATCHER_MYSQL_PASSWORD, etc.
+
+postgres:
+  enabled: true
+  url: "postgres://localhost:5432/excalibase?replication=database"
+  username: ""                        # or WATCHER_POSTGRES_USERNAME env var
+  password: ""                        # use WATCHER_POSTGRES_PASSWORD env var
+  slot_name: cdc_slot
+  publication_name: cdc_publication
+  create_slot: true
+  create_publication: true
+  tables: []                          # empty = all tables
+  snapshot_mode: none                 # none | chunked | backup_file
+  snapshot_chunk_size: 10000
+  snapshot_backup_file: ""
+  snapshot_start_lsn: ""             # required for backup_file mode
+  capture_ddl: false
+  schema_history_dir: ""             # optional, enables schema tracking
+
+mysql:
+  enabled: false
+  host: "localhost:3306"
+  username: ""                        # or WATCHER_MYSQL_USERNAME env var
+  password: ""                        # use WATCHER_MYSQL_PASSWORD env var
+  schema: excalibase
+  tables: []
+  snapshot_mode: none
+  snapshot_chunk_size: 10000
+  snapshot_backup_file: ""
+  offset_file: ""                    # optional, persists binlog position
+
+nats:
+  enabled: true
+  url: "nats://localhost:4222"
+  stream_name: CDC
+  subject_prefix: cdc
+  max_age_minutes: 5
+  storage: memory                    # memory | file
+
+health:
+  port: 8080
+  bind_address: "127.0.0.1"         # use 0.0.0.0 to expose externally
+
+metrics:
+  enabled: true

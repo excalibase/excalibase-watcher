@@ -1,0 +1,35 @@
+# Example: Watch MySQL only
+# helm install watcher helm/excalibase-watcher-go/ -f helm/examples/mysql-only.yaml
+
+postgres:
+  enabled: false
+
+mysql:
+  enabled: true
+  host: "mysql-service:3306"
+  # Use existingSecret in production:
+  # existingSecret: "my-mysql-secret"
+  username: "root"
+  password: "changeme"
+  schema: "mydb"
+  tables:
+    - orders
+    - users
+    - products
+  offsetFile: "/data/binlog.offset"
+
+nats:
+  url: "nats://nats-service:4222"
+  streamName: "CDC"
+  subjectPrefix: "cdc"
+  storage: "file"
+  maxAgeMinutes: 1440
+
+# Mount a persistent volume for offset store
+extraVolumeMounts:
+  - name: offset-data
+    mountPath: /data
+
+extraVolumes:
+  - name: offset-data
+    emptyDir: {}

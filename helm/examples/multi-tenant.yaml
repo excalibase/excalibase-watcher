@@ -1,0 +1,47 @@
+# Example: one watcher per tenant on a shared NATS JetStream.
+#
+# Prerequisite (once per NATS cluster, out-of-band or via another chart release):
+#   nats stream add CDC --subjects='cdc.>' --storage=file --retention=limits \
+#     --max-age=15m --discard=old --replicas=3 --defaults
+#
+# Install tenant-a:
+#   helm install watcher-tenant-a helm/excalibase-watcher-go/ \
+#     -f helm/examples/multi-tenant.yaml \
+#     --set nameOverride=watcher-tenant-a \
+#     --set nats.subjectPrefix=cdc.tenant-a \
+#     --set postgres.url="postgres://tenant-a-db:5432/app?replication=database" \
+#     --set postgres.existingSecret=tenant-a-db
+#
+# Install tenant-b:
+#   helm install watcher-tenant-b helm/excalibase-watcher-go/ \
+#     -f helm/examples/multi-tenant.yaml \
+#     --set nameOverride=watcher-tenant-b \
+#     --set nats.subjectPrefix=cdc.tenant-b \
+#     --set postgres.url="postgres://tenant-b-db:5432/app?replication=database" \
+#     --set postgres.existingSecret=tenant-b-db
+#
+# Both watchers publish to the SAME shared stream but under different subject
+# prefixes. Neither modifies the stream topology.
+
+postgres:
+  enabled: true
+  # url, existingSecret set per-tenant via --set
+  captureDdl: false
+  snapshotMode: "none"
+
+mysql:
+  enabled: false
+
+nats:
+  enabled: true
+  url: "nats://nats:4222"
+  streamName: "CDC"
+  # subjectPrefix set per-tenant via --set (e.g. cdc.tenant-a)
+  storage: "file"
+  maxAgeMinutes: 15
+  streamInit:
+    enabled: false  # stream is provisioned centrally, not per-release
+
+resources:
+  limits: { cpu: 200m, memory: 128Mi }
+  requests: { cpu: 50m, memory: 32Mi }
