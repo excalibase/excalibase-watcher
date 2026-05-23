@@ -33,7 +33,9 @@ jobs:
           cache: true
 
       - name: Test with coverage
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        # -tags=integration runs the testcontainer-backed listener/publisher tests
+        # alongside the plain unit tests so coverage covers the IO-heavy code paths.
+        run: go test -race -count=1 -tags=integration -timeout=10m -coverprofile=coverage.out ./...
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@fd88b7d7ccbaefd23d8f36f73b59db7a3d246602 # v6.0.0
