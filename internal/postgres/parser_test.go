@@ -618,3 +618,15 @@ func TestInvalidJSONFallsBackToString(t *testing.T) {
 		t.Errorf("data = %q\nwant  %q", event.Data, expected)
 	}
 }
+
+func TestSlotOwnerRegistryTableIsNeverEmitted(t *testing.T) {
+	p := NewParser(nil, false, nil)
+	p.Parse(buildRelationMsg(9, "public", slotOwnersTable, []testCol{{"slot_name", 25}}), "0/1")
+
+	if event := p.Parse(buildInsertMsg(9, []testTupleVal{{'t', "cdc_slot"}}), "0/2"); event != nil {
+		t.Errorf("INSERT on %s emitted %v", slotOwnersTable, event.Type)
+	}
+	if event := p.Parse(buildUpdateMsg(9, nil, []testTupleVal{{'t', "cdc_slot"}}), "0/3"); event != nil {
+		t.Errorf("UPDATE on %s emitted %v", slotOwnersTable, event.Type)
+	}
+}

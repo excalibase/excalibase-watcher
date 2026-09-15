@@ -23,11 +23,14 @@ import (
 )
 
 const (
-	heartbeatInterval        = 30 * time.Second
-	statusInterval           = 10 * time.Second
-	maxReconnectDelay        = 30 * time.Second
-	defaultSlotStatsInterval = 15 * time.Second
-	maintenanceQueryTimeout  = 5 * time.Second
+	heartbeatInterval          = 30 * time.Second
+	statusInterval             = 10 * time.Second
+	maxReconnectDelay          = 30 * time.Second
+	defaultSlotStatsInterval   = 15 * time.Second
+	maintenanceQueryTimeout    = 5 * time.Second
+	defaultSlotCleanupInterval = 10 * time.Minute
+	defaultSlotStaleAfter      = 30 * time.Minute
+	defaultSlotHeartbeat       = 30 * time.Second
 )
 
 type Listener struct {
@@ -37,6 +40,8 @@ type Listener struct {
 	schemaStore schema.HistoryStore
 	lag         *lagTracker
 	ack         *ackGate
+	registry    *slotRegistry
+	cleaner     *slotCleaner
 
 	conn *pgconn.PgConn
 	// maintenance serves slot-stat sampling; separate from the replication
@@ -123,6 +128,9 @@ func (l *Listener) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// Registered before the slot exists so a concurrent cleanup never sees an
+	// unowned slot.
+	l.setupSlotOwnership(ctx, setupConn)
 	if l.cfg.CreateSlot {
 		if err := createReplicationSlotIfNotExists(ctx, setupConn, l.cfg.SlotName); err != nil {
 			setupConn.Close(ctx)
@@ -153,8 +161,100 @@ func (l *Listener) Start(ctx context.Context) error {
 	l.wg.Add(2)
 	go l.listenLoop(ctx)
 	go l.sampleSlotStats(ctx)
+	l.startSlotMaintenance(ctx)
 
 	return nil
+}
+
+// setupSlotOwnership creates the owner registry and claims this watcher's
+// slot. Failure (typically missing CREATE privilege) disables the registry
+// and the cleanup routine but never prevents CDC from starting.
+func (l *Listener) setupSlotOwnership(ctx context.Context, db execer) {
+	if !l.cfg.SlotCleanup.Enabled {
+		return
+	}
+	registry := newSlotRegistry(l.cfg.SlotName, l.cfg.OwnerID)
+	if err := registry.ensureTable(ctx, db); err != nil {
+		slog.Warn("slot owner registry unavailable, slot cleanup disabled", "error", err)
+		return
+	}
+	if err := registry.register(ctx, db); err != nil {
+		slog.Warn("slot owner registration failed, slot cleanup disabled", "error", err)
+		return
+	}
+	l.registry = registry
+	l.cleaner = l.newSlotCleaner()
+}
+
+func (l *Listener) newSlotCleaner() *slotCleaner {
+	pattern, err := compileSlotPattern(l.cfg.SlotCleanup.SlotPattern)
+	if err != nil {
+		slog.Warn("invalid slot_cleanup.slot_pattern, slot cleanup disabled", "error", err)
+		return nil
+	}
+	rules := orphanRules{
+		ownSlot:           l.cfg.SlotName,
+		pattern:           pattern,
+		staleAfter:        minutesOrDefault(l.cfg.SlotCleanup.StaleAfterMinutes, defaultSlotStaleAfter),
+		retainedThreshold: uint64(max(l.cfg.SlotCleanup.RetainedWALThresholdBytes, 0)),
+		now:               time.Now,
+	}
+	interval := minutesOrDefault(l.cfg.SlotCleanup.IntervalMinutes, defaultSlotCleanupInterval)
+	fetch := func(ctx context.Context) ([]slotCandidate, error) {
+		ctx, cancel := context.WithTimeout(ctx, maintenanceQueryTimeout)
+		defer cancel()
+		return fetchSlotCandidates(ctx, l.maintenance)
+	}
+	drop := func(ctx context.Context, name string) error {
+		ctx, cancel := context.WithTimeout(ctx, maintenanceQueryTimeout)
+		defer cancel()
+		return dropReplicationSlot(ctx, l.maintenance, name)
+	}
+	return newSlotCleaner(rules, interval, l.cfg.SlotCleanup.DryRun, fetch, drop)
+}
+
+func (l *Listener) startSlotMaintenance(ctx context.Context) {
+	if l.registry == nil {
+		return
+	}
+	heartbeat := defaultSlotHeartbeat
+	if l.cfg.SlotCleanup.HeartbeatSeconds > 0 {
+		heartbeat = time.Duration(l.cfg.SlotCleanup.HeartbeatSeconds) * time.Second
+	}
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		l.registry.runHeartbeat(ctx, l.maintenance, heartbeat)
+	}()
+	if l.cleaner == nil {
+		return
+	}
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		l.cleaner.run(ctx)
+	}()
+}
+
+// releaseSlotOwnership marks the registry row on graceful shutdown so a
+// deliberate stop (scale-down, project pause) lets the next cleanup drop the
+// slot without waiting for the heartbeat to go stale.
+func (l *Listener) releaseSlotOwnership() {
+	if l.registry == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), maintenanceQueryTimeout)
+	defer cancel()
+	if err := l.registry.release(ctx, l.maintenance); err != nil {
+		slog.Warn("could not release slot ownership", "error", err)
+	}
+}
+
+func minutesOrDefault(minutes int, fallback time.Duration) time.Duration {
+	if minutes <= 0 {
+		return fallback
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 func (l *Listener) Stop() {
@@ -169,6 +269,7 @@ func (l *Listener) Stop() {
 		l.conn.Close(context.Background())
 		l.conn = nil
 	}
+	l.releaseSlotOwnership()
 	if l.maintenance != nil {
 		l.maintenance.Close()
 		l.maintenance = nil
@@ -435,7 +536,7 @@ func newMaintenancePool(ctx context.Context, cfg config.PostgresConfig) (*pgxpoo
 	if err != nil {
 		return nil, err
 	}
-	poolCfg.MaxConns = 2
+	poolCfg.MaxConns = 3
 	poolCfg.MinConns = 0
 	poolCfg.MaxConnIdleTime = time.Minute
 	return pgxpool.NewWithConfig(ctx, poolCfg)

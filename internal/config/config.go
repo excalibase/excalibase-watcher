@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -34,6 +35,22 @@ type PostgresConfig struct {
 	// SlotStatsIntervalSeconds is how often pg_replication_slots is sampled for
 	// the cdc_slot_* gauges and cdc_lag_seconds is refreshed.
 	SlotStatsIntervalSeconds int `mapstructure:"slot_stats_interval_seconds"`
+	// OwnerID identifies this watcher in the slot owner registry (default: hostname).
+	OwnerID     string            `mapstructure:"owner_id"`
+	SlotCleanup SlotCleanupConfig `mapstructure:"slot_cleanup"`
+}
+
+// SlotCleanupConfig controls orphaned replication slot detection and removal.
+type SlotCleanupConfig struct {
+	Enabled           bool `mapstructure:"enabled"`
+	IntervalMinutes   int  `mapstructure:"interval_minutes"`
+	StaleAfterMinutes int  `mapstructure:"stale_after_minutes"`
+	// RetainedWALThresholdBytes: only slots retaining more WAL than this are dropped; 0 = any.
+	RetainedWALThresholdBytes int64 `mapstructure:"retained_wal_threshold_bytes"`
+	DryRun                    bool  `mapstructure:"dry_run"`
+	// SlotPattern: only slots whose name matches this regexp are ever considered.
+	SlotPattern      string `mapstructure:"slot_pattern"`
+	HeartbeatSeconds int    `mapstructure:"heartbeat_seconds"`
 }
 
 type MySQLConfig struct {
@@ -78,6 +95,14 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("postgres.snapshot_mode", "none")
 	v.SetDefault("postgres.snapshot_chunk_size", 10000)
 	v.SetDefault("postgres.slot_stats_interval_seconds", 15)
+	v.SetDefault("postgres.owner_id", defaultOwnerID())
+	v.SetDefault("postgres.slot_cleanup.enabled", true)
+	v.SetDefault("postgres.slot_cleanup.interval_minutes", 10)
+	v.SetDefault("postgres.slot_cleanup.stale_after_minutes", 30)
+	v.SetDefault("postgres.slot_cleanup.retained_wal_threshold_bytes", 0)
+	v.SetDefault("postgres.slot_cleanup.dry_run", false)
+	v.SetDefault("postgres.slot_cleanup.slot_pattern", "^cdc_")
+	v.SetDefault("postgres.slot_cleanup.heartbeat_seconds", 30)
 
 	// Defaults — MySQL
 	v.SetDefault("mysql.enabled", false)
@@ -132,6 +157,14 @@ func Load(cfgFile string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func defaultOwnerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return "watcher"
+	}
+	return host
 }
 
 func ValidateSnapshotMode(mode string) error {

@@ -320,3 +320,60 @@ func TestSlotStatsIntervalFromEnv(t *testing.T) {
 		t.Errorf("postgres.slot_stats_interval_seconds from env = %d, want 5", cfg.Postgres.SlotStatsIntervalSeconds)
 	}
 }
+
+func TestSlotCleanupDefaults(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("postgres:\n  enabled: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	sc := cfg.Postgres.SlotCleanup
+	if !sc.Enabled {
+		t.Error("slot_cleanup.enabled default = false, want true")
+	}
+	if sc.IntervalMinutes != 10 {
+		t.Errorf("slot_cleanup.interval_minutes = %d, want 10", sc.IntervalMinutes)
+	}
+	if sc.StaleAfterMinutes != 30 {
+		t.Errorf("slot_cleanup.stale_after_minutes = %d, want 30", sc.StaleAfterMinutes)
+	}
+	if sc.RetainedWALThresholdBytes != 0 {
+		t.Errorf("slot_cleanup.retained_wal_threshold_bytes = %d, want 0", sc.RetainedWALThresholdBytes)
+	}
+	if sc.DryRun {
+		t.Error("slot_cleanup.dry_run default = true, want false")
+	}
+	if sc.SlotPattern != "^cdc_" {
+		t.Errorf("slot_cleanup.slot_pattern = %q, want ^cdc_", sc.SlotPattern)
+	}
+	if sc.HeartbeatSeconds != 30 {
+		t.Errorf("slot_cleanup.heartbeat_seconds = %d, want 30", sc.HeartbeatSeconds)
+	}
+	if cfg.Postgres.OwnerID == "" {
+		t.Error("postgres.owner_id must default to the hostname")
+	}
+}
+
+func TestSlotCleanupDryRunFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("postgres:\n  enabled: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WATCHER_POSTGRES_SLOT_CLEANUP_DRY_RUN", "true")
+	t.Setenv("WATCHER_POSTGRES_OWNER_ID", "pod-7")
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !cfg.Postgres.SlotCleanup.DryRun {
+		t.Error("WATCHER_POSTGRES_SLOT_CLEANUP_DRY_RUN=true not applied")
+	}
+	if cfg.Postgres.OwnerID != "pod-7" {
+		t.Errorf("owner_id from env = %q, want pod-7", cfg.Postgres.OwnerID)
+	}
+}

@@ -62,6 +62,13 @@ var (
 		},
 	)
 
+	SlotsDropped = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "cdc_slots_dropped_total",
+			Help: "Orphaned replication slots dropped by the cleanup routine",
+		},
+	)
+
 	LastEventTimestampSeconds = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "cdc_last_event_timestamp_seconds",
@@ -80,6 +87,10 @@ func IncNATSPublished(eventType string) {
 
 func IncNATSError() {
 	NATSErrors.Inc()
+}
+
+func IncSlotDropped() {
+	SlotsDropped.Inc()
 }
 
 func SetLagSeconds(seconds float64) {
