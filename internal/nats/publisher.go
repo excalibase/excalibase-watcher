@@ -65,13 +65,27 @@ func (p *Publisher) SetOnPublished(fn func(cdc.Event)) {
 	p.onPublished.Store(&fn)
 }
 
+// connectOptions turns the configured credential into dial options. A NATS
+// server that scopes permissions per principal also scopes the reply inbox,
+// so the prefix travels with the credential.
+func connectOptions(cfg config.NATSConfig) []nats.Option {
+	opts := []nats.Option{
+		nats.ReconnectWait(2 * time.Second),
+		nats.MaxReconnects(-1),
+	}
+	if cfg.Username != "" {
+		opts = append(opts, nats.UserInfo(cfg.Username, cfg.Password))
+	}
+	if cfg.InboxPrefix != "" {
+		opts = append(opts, nats.CustomInboxPrefix(cfg.InboxPrefix))
+	}
+	return opts
+}
+
 func (p *Publisher) Start(ctx context.Context) error {
 	ctx, p.cancel = context.WithCancel(ctx)
 
-	conn, err := nats.Connect(p.cfg.URL,
-		nats.ReconnectWait(2*time.Second),
-		nats.MaxReconnects(-1),
-	)
+	conn, err := nats.Connect(p.cfg.URL, connectOptions(p.cfg)...)
 	if err != nil {
 		return fmt.Errorf("connecting to NATS: %w", err)
 	}
