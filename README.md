@@ -43,7 +43,24 @@ cp config.example.yaml config.yaml
 Endpoints on `:8080`:
 - `GET /healthz` — liveness (UP when a listener is running)
 - `GET /readyz` — readiness
-- `GET /metrics` — Prometheus metrics (`cdc_events_total`, `cdc_nats_published_total`, `cdc_nats_errors_total`)
+- `GET /metrics` — Prometheus metrics (see below)
+
+### Metrics
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `cdc_events_total{type}` | counter | Events accepted onto the internal bus, by type |
+| `cdc_nats_published_total{type}` | counter | Events acknowledged by JetStream, by type |
+| `cdc_nats_errors_total` | counter | Failed publish attempts (each one is retried) |
+| `cdc_lag_seconds` | gauge | `now − commit timestamp` of the last COMMIT record processed. Keeps growing while WAL is still arriving or an event awaits its NATS ack; reset to `0` when a primary keepalive arrives with nothing pending (the watcher is caught up), until the next commit. Refreshed on every commit, keepalive and slot sample |
+| `cdc_slot_confirmed_flush_lsn` | gauge | `pg_replication_slots.confirmed_flush_lsn` as a 64-bit integer |
+| `cdc_slot_restart_lsn` | gauge | `pg_replication_slots.restart_lsn` as a 64-bit integer |
+| `cdc_slot_retained_wal_bytes` | gauge | WAL pinned by the slot: `pg_current_wal_lsn() − restart_lsn` (on a standby `pg_last_wal_receive_lsn()` is used) |
+| `cdc_last_event_timestamp_seconds` | gauge | Unix time the watcher last processed a WAL data record |
+
+Slot gauges are sampled from `pg_replication_slots` every `postgres.slot_stats_interval_seconds` (default 15, env `WATCHER_POSTGRES_SLOT_STATS_INTERVAL_SECONDS`) over a small maintenance pool that reconnects on its own after a database restart or hibernation. Lag is derived from the Postgres commit timestamp, so it also measures clock skew between the database and the watcher.
+
+**Ack ordering.** The slot's `confirmed_flush_lsn` only advances past an event once JetStream has acknowledged it: the listener remembers the LSN of every publishable event it hands to the bus and holds the standby status at the last acked LSN while any is outstanding. A failed publish is retried with backoff (never skipped), so a crash or restart re-streams exactly the unpublished tail. Without a NATS publisher (`nats.enabled=false`) every received LSN is confirmed.
 
 ## Configuration
 

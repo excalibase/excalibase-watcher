@@ -90,15 +90,19 @@ func appendTupleData(buf []byte, values []testTupleVal) []byte {
 // Build a BEGIN message: 'B' + finalLSN(8) + pgMicros(8) + xid(4)
 func buildBeginMsg(pgMicros uint64) []byte {
 	buf := []byte{'B'}
-	buf = appendUint64(buf, 0)         // finalLSN
-	buf = appendUint64(buf, pgMicros)  // timestamp in microseconds since 2000-01-01
-	buf = appendUint32(buf, 42)        // xid
+	buf = appendUint64(buf, 0)        // finalLSN
+	buf = appendUint64(buf, pgMicros) // timestamp in microseconds since 2000-01-01
+	buf = appendUint32(buf, 42)       // xid
 	return buf
 }
 
-// Build a COMMIT message: 'C'
-func buildCommitMsg() []byte {
-	return []byte{'C'}
+// Build a COMMIT message: 'C' + flags(1) + commit_lsn(8) + end_lsn(8) + commit_ts(8, micros since PG epoch)
+func buildCommitMsg(commitMicros uint64) []byte {
+	buf := []byte{'C', 0}
+	buf = appendUint64(buf, 0x16B3D80)
+	buf = appendUint64(buf, 0x16B3DB8)
+	buf = appendUint64(buf, commitMicros)
+	return buf
 }
 
 // Build a DELETE message: 'D' + relation_id(4) + tuple_type(1) + tuple_data
@@ -157,7 +161,7 @@ func TestParseBegin(t *testing.T) {
 }
 
 func TestParseCommit(t *testing.T) {
-	msg := buildCommitMsg()
+	msg := buildCommitMsg(2_000_000) // 2s after PG epoch
 	p := NewParser(nil, false, nil)
 	event := p.Parse(msg, "0/2")
 
@@ -167,6 +171,21 @@ func TestParseCommit(t *testing.T) {
 	if event.Type != cdc.Commit {
 		t.Errorf("type = %v, want COMMIT", event.Type)
 	}
+	if event.SourceTimestamp != 946684802000 {
+		t.Errorf("commit sourceTimestamp = %d, want 946684802000", event.SourceTimestamp)
+	}
+}
+
+func TestParseCommitWithoutBodyStillEmitsEvent(t *testing.T) {
+	p := NewParser(nil, false, nil)
+	event := p.Parse([]byte{'C'}, "0/2")
+
+	if event == nil || event.Type != cdc.Commit {
+		t.Fatalf("expected COMMIT event, got %v", event)
+	}
+	if event.SourceTimestamp != 0 {
+		t.Errorf("truncated COMMIT must not invent a timestamp, got %d", event.SourceTimestamp)
+	}
 }
 
 func TestParseRelationAndInsert(t *testing.T) {
@@ -174,8 +193,8 @@ func TestParseRelationAndInsert(t *testing.T) {
 
 	// First send RELATION
 	relMsg := buildRelationMsg(1, "public", "users", []testCol{
-		{"id", 23},    // INT4
-		{"name", 25},  // TEXT
+		{"id", 23},     // INT4
+		{"name", 25},   // TEXT
 		{"active", 16}, // BOOL
 	})
 	relEvent := p.Parse(relMsg, "0/1")
@@ -407,13 +426,13 @@ func TestNumericTypeMapping(t *testing.T) {
 	p := NewParser(nil, false, nil)
 
 	relMsg := buildRelationMsg(1, "public", "metrics", []testCol{
-		{"int2_val", 21},   // INT2
-		{"int4_val", 23},   // INT4
-		{"int8_val", 20},   // INT8
-		{"float4_val", 700}, // FLOAT4
-		{"float8_val", 701}, // FLOAT8
+		{"int2_val", 21},      // INT2
+		{"int4_val", 23},      // INT4
+		{"int8_val", 20},      // INT8
+		{"float4_val", 700},   // FLOAT4
+		{"float8_val", 701},   // FLOAT8
 		{"numeric_val", 1700}, // NUMERIC
-		{"oid_val", 26},    // OID
+		{"oid_val", 26},       // OID
 	})
 	p.Parse(relMsg, "0/1")
 

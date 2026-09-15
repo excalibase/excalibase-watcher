@@ -16,21 +16,24 @@ type Config struct {
 }
 
 type PostgresConfig struct {
-	Enabled           bool     `mapstructure:"enabled"`
-	URL               string   `mapstructure:"url"`
-	Username          string   `mapstructure:"username"`
-	Password          string   `mapstructure:"password"`
-	SlotName          string   `mapstructure:"slot_name"`
-	PublicationName   string   `mapstructure:"publication_name"`
-	CreateSlot        bool     `mapstructure:"create_slot"`
-	CreatePublication bool     `mapstructure:"create_publication"`
-	Tables            []string `mapstructure:"tables"`
-	SnapshotMode      string   `mapstructure:"snapshot_mode"`
-	SnapshotChunkSize int      `mapstructure:"snapshot_chunk_size"`
-	SnapshotBackupFile string  `mapstructure:"snapshot_backup_file"`
-	SnapshotStartLSN  string  `mapstructure:"snapshot_start_lsn"`
-	CaptureDDL        bool     `mapstructure:"capture_ddl"`
-	SchemaHistoryDir  string   `mapstructure:"schema_history_dir"`
+	Enabled            bool     `mapstructure:"enabled"`
+	URL                string   `mapstructure:"url"`
+	Username           string   `mapstructure:"username"`
+	Password           string   `mapstructure:"password"`
+	SlotName           string   `mapstructure:"slot_name"`
+	PublicationName    string   `mapstructure:"publication_name"`
+	CreateSlot         bool     `mapstructure:"create_slot"`
+	CreatePublication  bool     `mapstructure:"create_publication"`
+	Tables             []string `mapstructure:"tables"`
+	SnapshotMode       string   `mapstructure:"snapshot_mode"`
+	SnapshotChunkSize  int      `mapstructure:"snapshot_chunk_size"`
+	SnapshotBackupFile string   `mapstructure:"snapshot_backup_file"`
+	SnapshotStartLSN   string   `mapstructure:"snapshot_start_lsn"`
+	CaptureDDL         bool     `mapstructure:"capture_ddl"`
+	SchemaHistoryDir   string   `mapstructure:"schema_history_dir"`
+	// SlotStatsIntervalSeconds is how often pg_replication_slots is sampled for
+	// the cdc_slot_* gauges and cdc_lag_seconds is refreshed.
+	SlotStatsIntervalSeconds int `mapstructure:"slot_stats_interval_seconds"`
 }
 
 type MySQLConfig struct {
@@ -74,6 +77,7 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("postgres.create_publication", true)
 	v.SetDefault("postgres.snapshot_mode", "none")
 	v.SetDefault("postgres.snapshot_chunk_size", 10000)
+	v.SetDefault("postgres.slot_stats_interval_seconds", 15)
 
 	// Defaults — MySQL
 	v.SetDefault("mysql.enabled", false)

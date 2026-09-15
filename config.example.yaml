@@ -18,6 +18,7 @@ postgres:
   snapshot_start_lsn: ""             # required for backup_file mode
   capture_ddl: false
   schema_history_dir: ""             # optional, enables schema tracking
+  slot_stats_interval_seconds: 15    # pg_replication_slots sampling for cdc_slot_* gauges
 
 mysql:
   enabled: false

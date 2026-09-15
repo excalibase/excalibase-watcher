@@ -93,6 +93,7 @@ See `docs/JAVA_PARITY.md` for the full list.
 
 - **`replication=database` must be in the connection string** or `START_REPLICATION` fails with a cryptic syntax error. `pgjdbc` does this implicitly; Go does not.
 - **Acknowledge with `lastReceivedLSN + 1`**, not `lastReceivedLSN`. `pgjdbc` does the `+1` internally; Go requires it explicit.
+- **The Postgres ack is gated on the NATS ack.** `ackGate` (listener.go / ackgate.go) tracks the LSN of the last publishable event handed to the bus vs. the last one JetStream acked (`Publisher.SetOnPublished`), and `sendStatus` confirms only the acked position while anything is outstanding. Wire the observer BEFORE `Listener.Start`, otherwise early events are never observed and the gate holds forever. Keepalive positions (`ServerWALEnd`) are received and confirmed too, so `restart_lsn` advances during idle periods.
 - **Snapshot connection needs a different URL** — strip `replication=database` before using `pgx.Connect` for snapshot queries (otherwise you get a replication connection which can't run normal SELECTs).
 - **`CREATE PUBLICATION FOR ALL TABLES` captures future tables too.** Good — but be aware that creating the publication happens at watcher startup, so any table created **before** the publication existed may not be included until it's rediscovered via DDL.
 - **pgoutput column marker `u`** means "unchanged (TOAST)" — serialize as `"unchanged"` string, not skip the column.
@@ -141,7 +142,10 @@ internal/
     event.go                     # Event struct + EventType (custom MarshalJSON)
     service.go                   # Channel-based event bus, blocking send + backpressure
   postgres/
-    listener.go                  # pglogrepl WAL consumer, reconnect, heartbeat
+    listener.go                  # pglogrepl WAL consumer, reconnect, heartbeat, ack-gated status
+    ackgate.go                   # holds confirmed_flush at the last NATS-acked LSN
+    lag.go                       # cdc_lag_seconds tracker
+    slotstats.go                 # pg_replication_slots sampler (cdc_slot_* gauges)
     parser.go                    # pgoutput binary parser (B/C/R/I/U/D/T)
     setup.go                     # Publication/slot/DDL trigger creation, validateIdentifier
     snapshot_chunked.go          # PK-based SELECT chunking
@@ -155,7 +159,7 @@ internal/
   jsonutil/escape.go             # Shared RFC 8259 JSON string escape
   config/config.go               # Viper YAML + env var
   health/health.go               # HTTP /healthz /readyz
-  metrics/metrics.go             # Prometheus counters
+  metrics/metrics.go             # Prometheus counters + lag/slot gauges
   schema/history.go              # FileSchemaHistoryStore
 
 e2e/                             # Real-binary + docker-compose E2E tests

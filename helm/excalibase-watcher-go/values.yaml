@@ -72,6 +72,10 @@ postgres:
   # Schema history directory (empty = disabled)
   schemaHistoryDir: ""
 
+  # How often pg_replication_slots is sampled for the cdc_slot_* gauges and
+  # cdc_lag_seconds is refreshed
+  slotStatsIntervalSeconds: 15
+
 # ---------------------------------------------------------------------------
 # MySQL CDC
 # ---------------------------------------------------------------------------

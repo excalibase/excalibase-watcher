@@ -90,8 +90,7 @@ func (p *Parser) Parse(data []byte, lsn string) *cdc.Event {
 	case 'B':
 		return p.parseBegin(buf, lsn)
 	case 'C':
-		e := cdc.NewEvent(cdc.Commit, "", "", "", "COMMIT", lsn)
-		return &e
+		return p.parseCommit(buf, lsn)
 	case 'R':
 		return p.parseRelation(buf)
 	case 'I':
@@ -118,6 +117,22 @@ func (p *Parser) parseBegin(buf *reader, lsn string) *cdc.Event {
 		return &e
 	}
 	e := cdc.NewEvent(cdc.Begin, "", "", "", "BEGIN", lsn)
+	return &e
+}
+
+// parseCommit reads flags(1) + commit LSN(8) + end LSN(8) + commit timestamp(8).
+// The commit timestamp feeds cdc_lag_seconds.
+func (p *Parser) parseCommit(buf *reader, lsn string) *cdc.Event {
+	if buf.remaining() >= 25 {
+		buf.readByte()   // flags — unused
+		buf.readUint64() // commit LSN — skip
+		buf.readUint64() // end LSN — skip
+		pgMicros := buf.readUint64()
+		sourceTS := pgEpochOffsetMillis + int64(pgMicros/1000)
+		e := cdc.NewEventWithSourceTS(cdc.Commit, "", "", "", "COMMIT", lsn, sourceTS)
+		return &e
+	}
+	e := cdc.NewEvent(cdc.Commit, "", "", "", "COMMIT", lsn)
 	return &e
 }
 

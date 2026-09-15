@@ -22,6 +22,7 @@ data:
       snapshot_mode: {{ .Values.postgres.snapshotMode | quote }}
       snapshot_chunk_size: {{ .Values.postgres.snapshotChunkSize }}
       capture_ddl: {{ .Values.postgres.captureDdl }}
+      slot_stats_interval_seconds: {{ .Values.postgres.slotStatsIntervalSeconds | default 15 }}
       {{- if .Values.postgres.schemaHistoryDir }}
       schema_history_dir: {{ .Values.postgres.schemaHistoryDir | quote }}
       {{- end }}

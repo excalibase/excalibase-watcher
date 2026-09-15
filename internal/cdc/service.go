@@ -6,16 +6,18 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/excalibase/watcher-go/internal/metrics"
 )
 
 const (
-	defaultChanBuffer    = 100000            // 100k events buffered per subscriber
-	backpressureLogEvery = 10 * time.Second  // log at most once per interval when blocked
+	defaultChanBuffer    = 100000           // 100k events buffered per subscriber
+	backpressureLogEvery = 10 * time.Second // log at most once per interval when blocked
 )
 
 type subscriber struct {
-	ch          chan Event
-	lastWarnAt  atomic.Int64 // epoch nanos
+	ch         chan Event
+	lastWarnAt atomic.Int64 // epoch nanos
 }
 
 type Service struct {
@@ -91,6 +93,8 @@ func (s *Service) HandleEvent(event Event) {
 		)
 		return
 	}
+
+	metrics.IncEvent(event.Type.String())
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()

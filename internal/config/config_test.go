@@ -289,3 +289,34 @@ func TestValidateSnapshotMode(t *testing.T) {
 		})
 	}
 }
+
+func TestSlotStatsIntervalDefault(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("postgres:\n  enabled: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Postgres.SlotStatsIntervalSeconds != 15 {
+		t.Errorf("postgres.slot_stats_interval_seconds default = %d, want 15", cfg.Postgres.SlotStatsIntervalSeconds)
+	}
+}
+
+func TestSlotStatsIntervalFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("postgres:\n  enabled: true\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WATCHER_POSTGRES_SLOT_STATS_INTERVAL_SECONDS", "5")
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.Postgres.SlotStatsIntervalSeconds != 5 {
+		t.Errorf("postgres.slot_stats_interval_seconds from env = %d, want 5", cfg.Postgres.SlotStatsIntervalSeconds)
+	}
+}

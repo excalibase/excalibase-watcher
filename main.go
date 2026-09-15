@@ -55,7 +55,7 @@ func run() error {
 		defer stopPub()
 	}
 
-	stopPG, err := startPostgres(ctx, cfg, service)
+	stopPG, err := startPostgres(ctx, cfg, service, pub)
 	if err != nil {
 		return err
 	}
@@ -99,13 +99,18 @@ func startNATS(ctx context.Context, cfg *config.Config, service *cdc.Service) (*
 	return pub, pub.Stop, nil
 }
 
-func startPostgres(ctx context.Context, cfg *config.Config, service *cdc.Service) (func(), error) {
+func startPostgres(ctx context.Context, cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher) (func(), error) {
 	if !cfg.Postgres.Enabled {
 		return nil, nil
 	}
 	pgListener, err := pglistener.NewListener(cfg.Postgres, service)
 	if err != nil {
 		return nil, fmt.Errorf("creating postgres listener: %w", err)
+	}
+	if pub != nil {
+		// Wired before Start so no event can be published without being observed;
+		// the slot is only confirmed up to what NATS has acknowledged.
+		pub.SetOnPublished(pgListener.PublishedObserver())
 	}
 	if err := pgListener.Start(ctx); err != nil {
 		return nil, fmt.Errorf("starting postgres listener: %w", err)
