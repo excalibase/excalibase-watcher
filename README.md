@@ -43,7 +43,54 @@ cp config.example.yaml config.yaml
 Endpoints on `:8080`:
 - `GET /healthz` — liveness (UP when a listener is running)
 - `GET /readyz` — readiness
-- `GET /metrics` — Prometheus metrics (`cdc_events_total`, `cdc_nats_published_total`, `cdc_nats_errors_total`)
+- `GET /metrics` — Prometheus metrics (see below)
+
+### Metrics
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `cdc_events_total{type}` | counter | Events accepted onto the internal bus, by type |
+| `cdc_nats_published_total{type}` | counter | Events acknowledged by JetStream, by type |
+| `cdc_nats_errors_total` | counter | Failed publish attempts (each one is retried) |
+| `cdc_lag_seconds` | gauge | `now − commit timestamp` of the last COMMIT record processed. Keeps growing while WAL is still arriving or an event awaits its NATS ack; reset to `0` when a primary keepalive arrives with nothing pending (the watcher is caught up), until the next commit. Refreshed on every commit, keepalive and slot sample |
+| `cdc_slot_confirmed_flush_lsn` | gauge | `pg_replication_slots.confirmed_flush_lsn` as a 64-bit integer |
+| `cdc_slot_restart_lsn` | gauge | `pg_replication_slots.restart_lsn` as a 64-bit integer |
+| `cdc_slot_retained_wal_bytes` | gauge | WAL pinned by the slot: `pg_current_wal_lsn() − restart_lsn` (on a standby `pg_last_wal_receive_lsn()` is used) |
+| `cdc_last_event_timestamp_seconds` | gauge | Unix time the watcher last processed a WAL data record |
+| `cdc_slots_dropped_total` | counter | Orphaned replication slots dropped by the cleanup routine |
+
+Slot gauges are sampled from `pg_replication_slots` every `postgres.slot_stats_interval_seconds` (default 15, env `WATCHER_POSTGRES_SLOT_STATS_INTERVAL_SECONDS`) over a small maintenance pool that reconnects on its own after a database restart or hibernation. Lag is derived from the Postgres commit timestamp, so it also measures clock skew between the database and the watcher.
+
+### Orphaned replication slot cleanup
+
+An inactive logical slot retains WAL forever. The watcher therefore keeps an owner registry table in the source database, `excalibase_cdc_slot_owners` (`slot_name`, `owner_id`, `heartbeat_at`, `released_at`; created at startup, changes on it are never emitted as CDC events), and runs a cleanup pass at startup and every `interval_minutes`:
+
+1. Only logical slots of the current database whose name matches `slot_pattern` are considered (default `^cdc_`, which covers the chart default `cdc_slot` and the platform's `cdc_watcher`). Anything else is never touched.
+2. The watcher's own slot is never dropped, and an `active` slot is never dropped.
+3. If `retained_wal_threshold_bytes` > 0, slots retaining less WAL than that are kept.
+4. A slot whose registry row is marked `released_at` (its owner shut down gracefully) is dropped on the next pass.
+5. Otherwise the slot is dropped once its owner's `heartbeat_at` is older than `stale_after_minutes`. A slot with no registry row (created by an older watcher or by hand) uses the time this watcher first observed it inactive instead, so a mixed-version rollout is safe.
+
+Each watcher heartbeats its row every `heartbeat_seconds` and marks `released_at` on SIGTERM. Ownership is keyed by `owner_id` (default: hostname, i.e. the pod name).
+
+```yaml
+postgres:
+  owner_id: ""                       # WATCHER_POSTGRES_OWNER_ID, default hostname
+  slot_cleanup:
+    enabled: true                    # WATCHER_POSTGRES_SLOT_CLEANUP_ENABLED
+    interval_minutes: 10             # WATCHER_POSTGRES_SLOT_CLEANUP_INTERVAL_MINUTES
+    stale_after_minutes: 30          # WATCHER_POSTGRES_SLOT_CLEANUP_STALE_AFTER_MINUTES
+    retained_wal_threshold_bytes: 0  # WATCHER_POSTGRES_SLOT_CLEANUP_RETAINED_WAL_THRESHOLD_BYTES (0 = any)
+    dry_run: false                   # WATCHER_POSTGRES_SLOT_CLEANUP_DRY_RUN — log "would drop" only
+    slot_pattern: "^cdc_"            # WATCHER_POSTGRES_SLOT_CLEANUP_SLOT_PATTERN
+    heartbeat_seconds: 30            # WATCHER_POSTGRES_SLOT_CLEANUP_HEARTBEAT_SECONDS
+```
+
+If the database role cannot create the registry table, the watcher logs a warning, skips both heartbeat and cleanup, and streams CDC normally.
+
+**Interplay with project pause / hibernation.** Cleanup runs inside the watcher connected to that database, so a paused project (watcher scaled to zero, CNPG cluster hibernated) drops nothing while paused; its WAL is not growing either. Stop the watcher *before* hibernating the cluster so the SIGTERM handler can mark `released_at`. On resume the restarted watcher re-claims its own slot by name (never dropping it) and, if the slot name changed in between, the released old slot is dropped on the first cleanup pass instead of being retained for `stale_after_minutes`. If the watcher was killed without SIGTERM (node loss), the slot is dropped once the heartbeat is `stale_after_minutes` old — only by a watcher that is connected to that database.
+
+**Ack ordering.** The slot's `confirmed_flush_lsn` only advances past an event once JetStream has acknowledged it: the listener remembers the LSN of every publishable event it hands to the bus and holds the standby status at the last acked LSN while any is outstanding. A failed publish is retried with backoff (never skipped), so a crash or restart re-streams exactly the unpublished tail. Without a NATS publisher (`nats.enabled=false`) every received LSN is confirmed.
 
 ## Configuration
 

@@ -13,17 +13,24 @@ import (
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/config"
+	"github.com/excalibase/watcher-go/internal/metrics"
 	"github.com/excalibase/watcher-go/internal/schema"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
-	heartbeatInterval = 30 * time.Second
-	statusInterval    = 10 * time.Second
-	maxReconnectDelay = 30 * time.Second
+	heartbeatInterval          = 30 * time.Second
+	statusInterval             = 10 * time.Second
+	maxReconnectDelay          = 30 * time.Second
+	defaultSlotStatsInterval   = 15 * time.Second
+	maintenanceQueryTimeout    = 5 * time.Second
+	defaultSlotCleanupInterval = 10 * time.Minute
+	defaultSlotStaleAfter      = 30 * time.Minute
+	defaultSlotHeartbeat       = 30 * time.Second
 )
 
 type Listener struct {
@@ -31,11 +38,26 @@ type Listener struct {
 	service     *cdc.Service
 	parser      *Parser
 	schemaStore schema.HistoryStore
+	lag         *lagTracker
+	ack         *ackGate
+	registry    *slotRegistry
+	cleaner     *slotCleaner
 
-	conn    *pgconn.PgConn
-	running atomic.Bool
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
+	conn *pgconn.PgConn
+	// maintenance serves slot-stat sampling; separate from the replication
+	// connection, which cannot run SQL.
+	maintenance *pgxpool.Pool
+	running     atomic.Bool
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+}
+
+// replicationState is the per-connection bookkeeping of one streaming session.
+type replicationState struct {
+	receivedLSN   pglogrepl.LSN // end of the last WAL record or keepalive position received
+	lastFlushSent pglogrepl.LSN
+	lastStatus    time.Time
+	lastMessage   time.Time
 }
 
 func NewListener(cfg config.PostgresConfig, service *cdc.Service) (*Listener, error) {
@@ -56,17 +78,35 @@ func NewListener(cfg config.PostgresConfig, service *cdc.Service) (*Listener, er
 		}
 	}
 
-	parser := NewParser(tableFilter, cfg.CaptureDDL, store)
-	parser.SetEventHandler(func(e cdc.Event) {
-		service.HandleEvent(e)
-	})
-
-	return &Listener{
+	listener := &Listener{
 		cfg:         cfg,
 		service:     service,
-		parser:      parser,
+		parser:      NewParser(tableFilter, cfg.CaptureDDL, store),
 		schemaStore: store,
-	}, nil
+		lag:         newLagTracker(time.Now),
+		ack:         newAckGate(),
+	}
+	listener.parser.SetEventHandler(listener.emit)
+	return listener, nil
+}
+
+// PublishedObserver enables ack gating and returns the callback the NATS
+// publisher must invoke after each successful publish. Until wired, the
+// listener confirms every received LSN to the primary.
+func (l *Listener) PublishedObserver() func(cdc.Event) {
+	l.ack.Enable()
+	return l.ack.ObservePublished
+}
+
+// emit hands an event to the bus, remembering the position of publishable
+// events so the standby status can be held back until NATS acks them.
+func (l *Listener) emit(event cdc.Event) {
+	if cdc.IsPublishable(event.Type) {
+		if lsn, err := pglogrepl.ParseLSN(event.LSN); err == nil {
+			l.ack.Handed(lsn)
+		}
+	}
+	l.service.HandleEvent(event)
 }
 
 func (l *Listener) Start(ctx context.Context) error {
@@ -88,6 +128,9 @@ func (l *Listener) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// Registered before the slot exists so a concurrent cleanup never sees an
+	// unowned slot.
+	l.setupSlotOwnership(ctx, setupConn)
 	if l.cfg.CreateSlot {
 		if err := createReplicationSlotIfNotExists(ctx, setupConn, l.cfg.SlotName); err != nil {
 			setupConn.Close(ctx)
@@ -107,12 +150,111 @@ func (l *Listener) Start(ctx context.Context) error {
 		return fmt.Errorf("snapshot: %w", err)
 	}
 
-	// Start replication in background
+	pool, err := newMaintenancePool(ctx, l.cfg)
+	if err != nil {
+		return fmt.Errorf("maintenance pool: %w", err)
+	}
+	l.maintenance = pool
+
+	// Start replication + slot sampling in background
 	l.running.Store(true)
-	l.wg.Add(1)
+	l.wg.Add(2)
 	go l.listenLoop(ctx)
+	go l.sampleSlotStats(ctx)
+	l.startSlotMaintenance(ctx)
 
 	return nil
+}
+
+// setupSlotOwnership creates the owner registry and claims this watcher's
+// slot. Failure (typically missing CREATE privilege) disables the registry
+// and the cleanup routine but never prevents CDC from starting.
+func (l *Listener) setupSlotOwnership(ctx context.Context, db execer) {
+	if !l.cfg.SlotCleanup.Enabled {
+		return
+	}
+	registry := newSlotRegistry(l.cfg.SlotName, l.cfg.OwnerID)
+	if err := registry.ensureTable(ctx, db); err != nil {
+		slog.Warn("slot owner registry unavailable, slot cleanup disabled", "error", err)
+		return
+	}
+	if err := registry.register(ctx, db); err != nil {
+		slog.Warn("slot owner registration failed, slot cleanup disabled", "error", err)
+		return
+	}
+	l.registry = registry
+	l.cleaner = l.newSlotCleaner()
+}
+
+func (l *Listener) newSlotCleaner() *slotCleaner {
+	pattern, err := compileSlotPattern(l.cfg.SlotCleanup.SlotPattern)
+	if err != nil {
+		slog.Warn("invalid slot_cleanup.slot_pattern, slot cleanup disabled", "error", err)
+		return nil
+	}
+	rules := orphanRules{
+		ownSlot:           l.cfg.SlotName,
+		pattern:           pattern,
+		staleAfter:        minutesOrDefault(l.cfg.SlotCleanup.StaleAfterMinutes, defaultSlotStaleAfter),
+		retainedThreshold: uint64(max(l.cfg.SlotCleanup.RetainedWALThresholdBytes, 0)),
+		now:               time.Now,
+	}
+	interval := minutesOrDefault(l.cfg.SlotCleanup.IntervalMinutes, defaultSlotCleanupInterval)
+	fetch := func(ctx context.Context) ([]slotCandidate, error) {
+		ctx, cancel := context.WithTimeout(ctx, maintenanceQueryTimeout)
+		defer cancel()
+		return fetchSlotCandidates(ctx, l.maintenance)
+	}
+	drop := func(ctx context.Context, name string) error {
+		ctx, cancel := context.WithTimeout(ctx, maintenanceQueryTimeout)
+		defer cancel()
+		return dropReplicationSlot(ctx, l.maintenance, name)
+	}
+	return newSlotCleaner(rules, interval, l.cfg.SlotCleanup.DryRun, fetch, drop)
+}
+
+func (l *Listener) startSlotMaintenance(ctx context.Context) {
+	if l.registry == nil {
+		return
+	}
+	heartbeat := defaultSlotHeartbeat
+	if l.cfg.SlotCleanup.HeartbeatSeconds > 0 {
+		heartbeat = time.Duration(l.cfg.SlotCleanup.HeartbeatSeconds) * time.Second
+	}
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		l.registry.runHeartbeat(ctx, l.maintenance, heartbeat)
+	}()
+	if l.cleaner == nil {
+		return
+	}
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		l.cleaner.run(ctx)
+	}()
+}
+
+// releaseSlotOwnership marks the registry row on graceful shutdown so a
+// deliberate stop (scale-down, project pause) lets the next cleanup drop the
+// slot without waiting for the heartbeat to go stale.
+func (l *Listener) releaseSlotOwnership() {
+	if l.registry == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), maintenanceQueryTimeout)
+	defer cancel()
+	if err := l.registry.release(ctx, l.maintenance); err != nil {
+		slog.Warn("could not release slot ownership", "error", err)
+	}
+}
+
+func minutesOrDefault(minutes int, fallback time.Duration) time.Duration {
+	if minutes <= 0 {
+		return fallback
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 func (l *Listener) Stop() {
@@ -127,6 +269,28 @@ func (l *Listener) Stop() {
 		l.conn.Close(context.Background())
 		l.conn = nil
 	}
+	l.releaseSlotOwnership()
+	if l.maintenance != nil {
+		l.maintenance.Close()
+		l.maintenance = nil
+	}
+}
+
+func (l *Listener) slotStatsInterval() time.Duration {
+	if l.cfg.SlotStatsIntervalSeconds <= 0 {
+		return defaultSlotStatsInterval
+	}
+	return time.Duration(l.cfg.SlotStatsIntervalSeconds) * time.Second
+}
+
+func (l *Listener) sampleSlotStats(ctx context.Context) {
+	defer l.wg.Done()
+	sampler := newSlotSampler(l.slotStatsInterval(), l.lag, func(ctx context.Context) (SlotStats, error) {
+		ctx, cancel := context.WithTimeout(ctx, maintenanceQueryTimeout)
+		defer cancel()
+		return querySlotStats(ctx, l.maintenance, l.cfg.SlotName)
+	})
+	sampler.run(ctx)
 }
 
 func (l *Listener) IsRunning() bool {
@@ -171,11 +335,8 @@ func (l *Listener) connectAndStream(ctx context.Context) error {
 		return err
 	}
 
-	var currentLSN pglogrepl.LSN
-	l.parser.SetLSNProvider(func() string { return currentLSN.String() })
-
-	lastStatus := time.Now()
-	lastMessage := time.Now()
+	state := &replicationState{lastStatus: time.Now(), lastMessage: time.Now()}
+	l.parser.SetLSNProvider(func() string { return state.receivedLSN.String() })
 
 	for l.running.Load() {
 		if ctx.Err() != nil {
@@ -190,11 +351,11 @@ func (l *Listener) connectAndStream(ctx context.Context) error {
 			return fmt.Errorf("receive message: %w", err)
 		}
 
-		if err := l.handleMessage(ctx, conn, rawMsg, &currentLSN, &lastStatus, &lastMessage); err != nil {
+		if err := l.handleMessage(ctx, conn, rawMsg, state); err != nil {
 			return err
 		}
 
-		if err := l.maintainHeartbeatAndStatus(ctx, conn, currentLSN, &lastStatus, &lastMessage); err != nil {
+		if err := l.maintainHeartbeatAndStatus(ctx, conn, state); err != nil {
 			return err
 		}
 	}
@@ -202,14 +363,22 @@ func (l *Listener) connectAndStream(ctx context.Context) error {
 	return nil
 }
 
-func (l *Listener) sendStatus(ctx context.Context, conn *pgconn.PgConn, lsn pglogrepl.LSN) error {
+// sendStatus confirms the ack-gated flush position to the primary. A zero
+// position (nothing acked yet in this session) is sent as-is: Postgres treats
+// it as "no progress" while still counting the message as a keepalive reply.
+func (l *Listener) sendStatus(ctx context.Context, conn *pgconn.PgConn, state *replicationState) error {
+	flush := l.ack.FlushLSN(state.receivedLSN)
+	position := flush
+	if position > 0 {
+		position++ // Must add 1 for ack
+	}
 	err := pglogrepl.SendStandbyStatusUpdate(ctx, conn,
-		pglogrepl.StandbyStatusUpdate{
-			WALWritePosition: lsn + 1, // Must add 1 for ack
-		})
+		pglogrepl.StandbyStatusUpdate{WALWritePosition: position})
 	if err != nil {
 		return fmt.Errorf("send status: %w", err)
 	}
+	state.lastFlushSent = flush
+	state.lastStatus = time.Now()
 	return nil
 }
 
@@ -254,7 +423,7 @@ func (l *Listener) startReplication(ctx context.Context, conn *pgconn.PgConn) er
 }
 
 func (l *Listener) handleMessage(ctx context.Context, conn *pgconn.PgConn, rawMsg pgproto3.BackendMessage,
-	currentLSN *pglogrepl.LSN, lastStatus, lastMessage *time.Time) error {
+	state *replicationState) error {
 	copyData, ok := rawMsg.(*pgproto3.CopyData)
 	if !ok {
 		slog.Debug("unexpected message type", "msg", fmt.Sprintf("%T", rawMsg))
@@ -262,56 +431,69 @@ func (l *Listener) handleMessage(ctx context.Context, conn *pgconn.PgConn, rawMs
 	}
 	switch copyData.Data[0] {
 	case pglogrepl.PrimaryKeepaliveMessageByteID:
-		return l.handleKeepalive(ctx, conn, copyData.Data[1:], *currentLSN, lastStatus)
+		return l.handleKeepalive(ctx, conn, copyData.Data[1:], state)
 	case pglogrepl.XLogDataByteID:
-		return l.handleXLogData(copyData.Data[1:], currentLSN, lastMessage)
+		return l.handleXLogData(copyData.Data[1:], state)
 	}
 	return nil
 }
 
+// handleKeepalive processes a primary keepalive. The walsender sends one when
+// it has nothing more to send, so its position is safe to receive (every
+// record before it was already streamed) and, if no event awaits a NATS ack,
+// the watcher is caught up. A status is sent when the primary asks for a
+// reply or when the confirmable position moved since the last status, which
+// lets restart_lsn advance promptly during idle periods.
 func (l *Listener) handleKeepalive(ctx context.Context, conn *pgconn.PgConn, data []byte,
-	currentLSN pglogrepl.LSN, lastStatus *time.Time) error {
+	state *replicationState) error {
 	pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(data)
 	if err != nil {
 		return fmt.Errorf("parse keepalive: %w", err)
 	}
-	if !pkm.ReplyRequested {
+	if pkm.ServerWALEnd > state.receivedLSN {
+		state.receivedLSN = pkm.ServerWALEnd
+	}
+	if !l.ack.Pending() {
+		l.lag.ObserveCaughtUp()
+	}
+	if !pkm.ReplyRequested && l.ack.FlushLSN(state.receivedLSN) == state.lastFlushSent {
 		return nil
 	}
-	if err := l.sendStatus(ctx, conn, currentLSN); err != nil {
-		return err
-	}
-	*lastStatus = time.Now()
-	return nil
+	return l.sendStatus(ctx, conn, state)
 }
 
-func (l *Listener) handleXLogData(data []byte, currentLSN *pglogrepl.LSN, lastMessage *time.Time) error {
+func (l *Listener) handleXLogData(data []byte, state *replicationState) error {
 	xld, err := pglogrepl.ParseXLogData(data)
 	if err != nil {
 		return fmt.Errorf("parse xlog data: %w", err)
 	}
-	*currentLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
-	*lastMessage = time.Now()
+	state.receivedLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
+	state.lastMessage = time.Now()
+	metrics.SetLastEventTimestamp(state.lastMessage)
 
-	if event := l.parser.Parse(xld.WALData, currentLSN.String()); event != nil {
-		l.service.HandleEvent(*event)
+	event := l.parser.Parse(xld.WALData, state.receivedLSN.String())
+	if event == nil {
+		return nil
 	}
+	if event.Type == cdc.Commit && event.SourceTimestamp > 0 {
+		l.lag.ObserveCommit(time.UnixMilli(event.SourceTimestamp))
+	}
+	l.emit(*event)
 	return nil
 }
 
 func (l *Listener) maintainHeartbeatAndStatus(ctx context.Context, conn *pgconn.PgConn,
-	currentLSN pglogrepl.LSN, lastStatus, lastMessage *time.Time) error {
-	if time.Since(*lastStatus) >= statusInterval {
-		if err := l.sendStatus(ctx, conn, currentLSN); err != nil {
+	state *replicationState) error {
+	if time.Since(state.lastStatus) >= statusInterval {
+		if err := l.sendStatus(ctx, conn, state); err != nil {
 			return err
 		}
-		*lastStatus = time.Now()
 	}
-	if time.Since(*lastMessage) >= heartbeatInterval {
-		e := cdc.NewEvent(cdc.Heartbeat, "", "", "", "HEARTBEAT", currentLSN.String())
+	if time.Since(state.lastMessage) >= heartbeatInterval {
+		e := cdc.NewEvent(cdc.Heartbeat, "", "", "", "HEARTBEAT", state.receivedLSN.String())
 		l.service.HandleEvent(e)
-		*lastMessage = time.Now()
-		if err := l.sendStatus(ctx, conn, currentLSN); err != nil {
+		state.lastMessage = time.Now()
+		if err := l.sendStatus(ctx, conn, state); err != nil {
 			return err
 		}
 	}
@@ -343,6 +525,24 @@ func (l *Listener) runSnapshot(ctx context.Context) error {
 
 // connectStandard creates a standard (non-replication) pgx connection.
 func connectStandard(ctx context.Context, cfg config.PostgresConfig) (*pgx.Conn, error) {
+	return pgx.Connect(ctx, standardConnString(cfg))
+}
+
+// newMaintenancePool is a tiny lazily-connecting pool for periodic SQL
+// (slot stats). It reconnects on its own after the database restarts or
+// resumes from hibernation, so no maintenance goroutine has to manage that.
+func newMaintenancePool(ctx context.Context, cfg config.PostgresConfig) (*pgxpool.Pool, error) {
+	poolCfg, err := pgxpool.ParseConfig(standardConnString(cfg))
+	if err != nil {
+		return nil, err
+	}
+	poolCfg.MaxConns = 3
+	poolCfg.MinConns = 0
+	poolCfg.MaxConnIdleTime = time.Minute
+	return pgxpool.NewWithConfig(ctx, poolCfg)
+}
+
+func standardConnString(cfg config.PostgresConfig) string {
 	connStr := stripReplicationParam(cfg.URL)
 	if cfg.Username != "" {
 		// Inject credentials if not in URL
@@ -352,7 +552,7 @@ func connectStandard(ctx context.Context, cfg config.PostgresConfig) (*pgx.Conn,
 			connStr = u.String()
 		}
 	}
-	return pgx.Connect(ctx, connStr)
+	return connStr
 }
 
 func ensureReplicationParam(connStr string) string {

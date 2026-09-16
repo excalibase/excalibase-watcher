@@ -80,10 +80,11 @@ func TestSetOnPublished(t *testing.T) {
 	p := NewPublisher(config.NATSConfig{}, svc)
 	var called bool
 	p.SetOnPublished(func(cdc.Event) { called = true })
-	if p.onPublished == nil {
+	fn := p.onPublished.Load()
+	if fn == nil {
 		t.Fatal("onPublished not set")
 	}
-	p.onPublished(cdc.Event{})
+	(*fn)(cdc.Event{})
 	if !called {
 		t.Error("callback not invoked")
 	}

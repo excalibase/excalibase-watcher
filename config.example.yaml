@@ -18,6 +18,16 @@ postgres:
   snapshot_start_lsn: ""             # required for backup_file mode
   capture_ddl: false
   schema_history_dir: ""             # optional, enables schema tracking
+  slot_stats_interval_seconds: 15    # pg_replication_slots sampling for cdc_slot_* gauges
+  owner_id: ""                       # slot owner registry id, default hostname
+  slot_cleanup:                      # orphaned replication slot cleanup (see README)
+    enabled: true
+    interval_minutes: 10
+    stale_after_minutes: 30
+    retained_wal_threshold_bytes: 0  # 0 = any retained WAL qualifies
+    dry_run: false                   # WATCHER_POSTGRES_SLOT_CLEANUP_DRY_RUN
+    slot_pattern: "^cdc_"
+    heartbeat_seconds: 30
 
 mysql:
   enabled: false

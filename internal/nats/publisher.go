@@ -13,6 +13,7 @@ import (
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/config"
+	"github.com/excalibase/watcher-go/internal/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -28,13 +29,23 @@ type Publisher struct {
 	// lastAckedLSN is updated after every successful js.Publish ack.
 	// Offset-persisting listeners read this to advance storage safely.
 	lastAckedLSN atomic.Value // string
-	onPublished  func(cdc.Event)
+	onPublished  atomic.Pointer[func(cdc.Event)]
+
+	// publishFn performs one publish attempt; tests substitute a fake.
+	publishFn      func(ctx context.Context, subject string, data []byte) error
+	retryBaseDelay time.Duration
 }
+
+const (
+	defaultRetryBaseDelay = 500 * time.Millisecond
+	maxRetryDelay         = 10 * time.Second
+)
 
 func NewPublisher(cfg config.NATSConfig, service *cdc.Service) *Publisher {
 	p := &Publisher{
-		cfg:     cfg,
-		service: service,
+		cfg:            cfg,
+		service:        service,
+		retryBaseDelay: defaultRetryBaseDelay,
 	}
 	p.lastAckedLSN.Store("")
 	return p
@@ -49,9 +60,9 @@ func (p *Publisher) LastAckedLSN() string {
 
 // SetOnPublished registers a callback invoked after each successful publish.
 // The callback runs on the publisher goroutine, so it must be fast and
-// non-blocking (writing to a channel or atomic is fine).
+// non-blocking (writing to a channel or atomic is fine). Safe to call after Start.
 func (p *Publisher) SetOnPublished(fn func(cdc.Event)) {
-	p.onPublished = fn
+	p.onPublished.Store(&fn)
 }
 
 func (p *Publisher) Start(ctx context.Context) error {
@@ -72,6 +83,10 @@ func (p *Publisher) Start(ctx context.Context) error {
 		return fmt.Errorf("creating JetStream: %w", err)
 	}
 	p.js = js
+	p.publishFn = func(ctx context.Context, subject string, data []byte) error {
+		_, err := js.Publish(ctx, subject, data)
+		return err
+	}
 
 	// Create or update stream (idempotent)
 	if err := p.ensureStream(ctx); err != nil {
@@ -149,11 +164,8 @@ func (p *Publisher) publishLoop(ctx context.Context, ch <-chan cdc.Event) {
 			if !shouldPublish(event.Type) {
 				continue
 			}
-			if err := p.publish(ctx, event); err != nil {
-				slog.Warn("failed to publish event",
-					"type", event.Type.String(),
-					"error", err,
-				)
+			if err := p.publish(ctx, event); err != nil && ctx.Err() == nil {
+				slog.Warn("giving up on event", "type", event.Type.String(), "error", err)
 			}
 		case <-ctx.Done():
 			return
@@ -161,6 +173,10 @@ func (p *Publisher) publishLoop(ctx context.Context, ch <-chan cdc.Event) {
 	}
 }
 
+// publish delivers one event to JetStream, retrying with backoff until the
+// broker acks or ctx ends. Skipping a failed event would let the source
+// position advance past it (see ackGate / offsetSaver) and lose it, so the
+// publisher blocks instead: the database retains WAL/binlog meanwhile.
 func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 	subject := buildSubject(p.cfg.SubjectPrefix, event.Schema, event.Table)
 
@@ -169,19 +185,38 @@ func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 		return fmt.Errorf("marshaling event: %w", err)
 	}
 
-	if _, err := p.js.Publish(ctx, subject, data); err != nil {
+	if err := p.publishWithRetry(ctx, subject, data, event.Type.String()); err != nil {
 		return err
 	}
 
 	// Ack received from NATS. Record position and notify subscribers so they
 	// can safely advance persisted offsets.
+	metrics.IncNATSPublished(event.Type.String())
 	if event.LSN != "" {
 		p.lastAckedLSN.Store(event.LSN)
 	}
-	if p.onPublished != nil {
-		p.onPublished(event)
+	if fn := p.onPublished.Load(); fn != nil {
+		(*fn)(event)
 	}
 	return nil
+}
+
+func (p *Publisher) publishWithRetry(ctx context.Context, subject string, data []byte, eventType string) error {
+	delay := p.retryBaseDelay
+	for {
+		err := p.publishFn(ctx, subject, data)
+		if err == nil {
+			return nil
+		}
+		metrics.IncNATSError()
+		slog.Warn("publish failed, retrying", "type", eventType, "delay", delay, "error", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, maxRetryDelay)
+	}
 }
 
 func buildSubject(prefix, schema, table string) string {
@@ -205,10 +240,5 @@ func sanitizeSubjectToken(s string) string {
 }
 
 func shouldPublish(t cdc.EventType) bool {
-	switch t {
-	case cdc.Insert, cdc.Update, cdc.Delete, cdc.DDL, cdc.Truncate:
-		return true
-	default:
-		return false
-	}
+	return cdc.IsPublishable(t)
 }
