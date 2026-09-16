@@ -23,6 +23,16 @@ data:
       snapshot_chunk_size: {{ .Values.postgres.snapshotChunkSize }}
       capture_ddl: {{ .Values.postgres.captureDdl }}
       slot_stats_interval_seconds: {{ .Values.postgres.slotStatsIntervalSeconds | default 15 }}
+      {{- with .Values.postgres.slotCleanup }}
+      slot_cleanup:
+        enabled: {{ .enabled }}
+        interval_minutes: {{ .intervalMinutes | default 10 }}
+        stale_after_minutes: {{ .staleAfterMinutes | default 30 }}
+        retained_wal_threshold_bytes: {{ .retainedWalThresholdBytes | default 0 }}
+        dry_run: {{ .dryRun | default false }}
+        slot_pattern: {{ .slotPattern | default "^cdc_" | quote }}
+        heartbeat_seconds: {{ .heartbeatSeconds | default 30 }}
+      {{- end }}
       {{- if .Values.postgres.schemaHistoryDir }}
       schema_history_dir: {{ .Values.postgres.schemaHistoryDir | quote }}
       {{- end }}

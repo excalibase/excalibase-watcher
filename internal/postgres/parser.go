@@ -373,6 +373,9 @@ func writeTextValue(sb *strings.Builder, buf *reader, typeOID int) {
 }
 
 func (p *Parser) passesFilter(tableName string) bool {
+	if tableName == slotOwnersTable {
+		return false // watcher-internal bookkeeping, never a CDC event
+	}
 	if len(p.tableFilter) == 0 {
 		return true
 	}

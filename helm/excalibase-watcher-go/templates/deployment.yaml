@@ -46,6 +46,11 @@ spec:
               containerPort: {{ .Values.health.port }}
               protocol: TCP
           env:
+            {{- /* Pod name identifies this watcher in the slot owner registry */}}
+            - name: WATCHER_POSTGRES_OWNER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             {{- /* Secrets injected as env vars — Viper BindEnv picks them up */}}
             {{- if .Values.postgres.enabled }}
             - name: WATCHER_POSTGRES_USERNAME

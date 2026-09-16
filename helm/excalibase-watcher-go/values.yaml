@@ -76,6 +76,18 @@ postgres:
   # cdc_lag_seconds is refreshed
   slotStatsIntervalSeconds: 15
 
+  # Orphaned replication slot cleanup. Slots matching slotPattern that are
+  # inactive and whose owner (excalibase_cdc_slot_owners registry) released
+  # them or stopped heartbeating for staleAfterMinutes are dropped.
+  slotCleanup:
+    enabled: true
+    intervalMinutes: 10
+    staleAfterMinutes: 30
+    retainedWalThresholdBytes: 0     # 0 = any retained WAL qualifies
+    dryRun: false                    # log "would drop" only
+    slotPattern: "^cdc_"
+    heartbeatSeconds: 30
+
 # ---------------------------------------------------------------------------
 # MySQL CDC
 # ---------------------------------------------------------------------------

@@ -93,6 +93,7 @@ See `docs/JAVA_PARITY.md` for the full list.
 
 - **`replication=database` must be in the connection string** or `START_REPLICATION` fails with a cryptic syntax error. `pgjdbc` does this implicitly; Go does not.
 - **Acknowledge with `lastReceivedLSN + 1`**, not `lastReceivedLSN`. `pgjdbc` does the `+1` internally; Go requires it explicit.
+- **`excalibase_cdc_slot_owners` is watcher-internal.** Its heartbeat UPDATEs flow through the publication (FOR ALL TABLES) and are dropped in `Parser.passesFilter`. The registry row is claimed BEFORE the slot is created (so a concurrent cleaner never sees an unowned slot) and released in `Stop()`; the pause flow must SIGTERM the watcher before hibernating the cluster or `released_at` can't be written.
 - **The Postgres ack is gated on the NATS ack.** `ackGate` (listener.go / ackgate.go) tracks the LSN of the last publishable event handed to the bus vs. the last one JetStream acked (`Publisher.SetOnPublished`), and `sendStatus` confirms only the acked position while anything is outstanding. Wire the observer BEFORE `Listener.Start`, otherwise early events are never observed and the gate holds forever. Keepalive positions (`ServerWALEnd`) are received and confirmed too, so `restart_lsn` advances during idle periods.
 - **Snapshot connection needs a different URL** — strip `replication=database` before using `pgx.Connect` for snapshot queries (otherwise you get a replication connection which can't run normal SELECTs).
 - **`CREATE PUBLICATION FOR ALL TABLES` captures future tables too.** Good — but be aware that creating the publication happens at watcher startup, so any table created **before** the publication existed may not be included until it's rediscovered via DDL.
@@ -146,6 +147,8 @@ internal/
     ackgate.go                   # holds confirmed_flush at the last NATS-acked LSN
     lag.go                       # cdc_lag_seconds tracker
     slotstats.go                 # pg_replication_slots sampler (cdc_slot_* gauges)
+    slotregistry.go              # excalibase_cdc_slot_owners: register/heartbeat/release
+    slotcleanup.go               # orphan decision rules + periodic pg_drop_replication_slot
     parser.go                    # pgoutput binary parser (B/C/R/I/U/D/T)
     setup.go                     # Publication/slot/DDL trigger creation, validateIdentifier
     snapshot_chunked.go          # PK-based SELECT chunking

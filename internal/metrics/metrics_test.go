@@ -63,3 +63,11 @@ func TestSetLastEventTimestamp(t *testing.T) {
 		t.Errorf("cdc_last_event_timestamp_seconds = %f, want 1700000000.5", v)
 	}
 }
+
+func TestIncSlotDropped(t *testing.T) {
+	before := testutil.ToFloat64(SlotsDropped)
+	IncSlotDropped()
+	if got := testutil.ToFloat64(SlotsDropped); got != before+1 {
+		t.Errorf("cdc_slots_dropped_total = %f, want %f", got, before+1)
+	}
+}
