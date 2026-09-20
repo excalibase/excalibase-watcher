@@ -73,6 +73,15 @@ type NATSConfig struct {
 	SubjectPrefix string `mapstructure:"subject_prefix"`
 	MaxAgeMinutes int    `mapstructure:"max_age_minutes"`
 	Storage       string `mapstructure:"storage"`
+	// Username/Password authenticate this watcher to a NATS server that
+	// scopes publish permissions per principal. Blank connects anonymously.
+	Username string `mapstructure:"username"`
+	Password string `mapstructure:"password"`
+	// InboxPrefix is the request/reply subject space this principal is
+	// allowed to subscribe to. It must match what the server grants,
+	// otherwise JetStream publish acks never arrive. Blank keeps the
+	// client default (_INBOX).
+	InboxPrefix string `mapstructure:"inbox_prefix"`
 }
 
 type HealthConfig struct {
@@ -143,6 +152,9 @@ func Load(cfgFile string) (*Config, error) {
 	v.BindEnv("mysql.username", "WATCHER_MYSQL_USERNAME")
 	v.BindEnv("mysql.password", "WATCHER_MYSQL_PASSWORD")
 	v.BindEnv("nats.url", "WATCHER_NATS_URL")
+	v.BindEnv("nats.username", "WATCHER_NATS_USERNAME")
+	v.BindEnv("nats.password", "WATCHER_NATS_PASSWORD")
+	v.BindEnv("nats.inbox_prefix", "WATCHER_NATS_INBOX_PREFIX")
 
 	var cfg Config
 	if err := v.Unmarshal(&cfg); err != nil {
