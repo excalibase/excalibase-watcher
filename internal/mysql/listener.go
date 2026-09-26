@@ -276,27 +276,31 @@ func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
 	if file := h.currentBinlogFile(); file != "" && e.Header != nil {
 		lsn = fmt.Sprintf("%s:%d", file, e.Header.LogPos)
 	}
+	// All rows of one rows event share its position; the row index tells them apart.
+	publish := func(event cdc.Event, row int) {
+		if lsn != "" {
+			event.SourceID = fmt.Sprintf("mysql:%s:%d", lsn, row)
+		}
+		h.service.HandleEvent(event)
+	}
 
 	switch e.Action {
 	case canal.InsertAction:
-		for _, row := range e.Rows {
+		for i, row := range e.Rows {
 			data := rowToJSON(e.Table, row)
-			event := cdc.NewEvent(cdc.Insert, schemaName, table, data, "INSERT", lsn)
-			h.service.HandleEvent(event)
+			publish(cdc.NewEvent(cdc.Insert, schemaName, table, data, "INSERT", lsn), i)
 		}
 	case canal.UpdateAction:
 		for i := 0; i+1 < len(e.Rows); i += 2 {
 			oldData := rowToJSON(e.Table, e.Rows[i])
 			newData := rowToJSON(e.Table, e.Rows[i+1])
 			data := fmt.Sprintf(`{"old":%s, "new":%s}`, oldData, newData)
-			event := cdc.NewEvent(cdc.Update, schemaName, table, data, "UPDATE", lsn)
-			h.service.HandleEvent(event)
+			publish(cdc.NewEvent(cdc.Update, schemaName, table, data, "UPDATE", lsn), i/2)
 		}
 	case canal.DeleteAction:
-		for _, row := range e.Rows {
+		for i, row := range e.Rows {
 			data := rowToJSON(e.Table, row)
-			event := cdc.NewEvent(cdc.Delete, schemaName, table, data, "DELETE", lsn)
-			h.service.HandleEvent(event)
+			publish(cdc.NewEvent(cdc.Delete, schemaName, table, data, "DELETE", lsn), i)
 		}
 	}
 	return nil
@@ -316,6 +320,9 @@ func (h *eventHandler) OnDDL(_ *replication.EventHeader, nextPos mysql.Position,
 	query := string(queryEvent.Query)
 	// Match Java format: raw SQL as data field
 	event := cdc.NewEvent(cdc.DDL, ddlSchema, "", query, "DDL", "")
+	if nextPos.Name != "" {
+		event.SourceID = fmt.Sprintf("mysql:%s:%d:ddl", nextPos.Name, nextPos.Pos)
+	}
 	h.service.HandleEvent(event)
 	return nil
 }

@@ -26,6 +26,8 @@ spec:
               set -e
               # Idempotent: `nats stream add` fails if the stream exists, which we ignore.
               # This preserves whatever topology is already provisioned by infra.
+              # The duplicate window matches max-age so re-published changes are
+              # dropped for as long as the stream keeps them.
               nats --server={{ .Values.nats.url }} stream add {{ .Values.nats.streamName }} \
                 --subjects='{{ .Values.nats.streamInit.subjects }}' \
                 --storage={{ .Values.nats.storage }} \
@@ -34,7 +36,7 @@ spec:
                 --discard={{ .Values.nats.streamInit.discard }} \
                 --replicas={{ .Values.nats.streamInit.replicas }} \
                 --max-msgs=-1 --max-bytes=-1 --max-msg-size=-1 \
-                --dupe-window=2m \
+                --dupe-window={{ .Values.nats.maxAgeMinutes }}m \
                 --defaults \
                 || echo "stream {{ .Values.nats.streamName }} already exists, leaving it unchanged"
 {{- end }}

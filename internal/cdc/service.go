@@ -18,6 +18,18 @@ const (
 type subscriber struct {
 	ch         chan Event
 	lastWarnAt atomic.Int64 // epoch nanos
+	// done is closed by unsubscribe before it takes the service lock, so a
+	// producer blocked on this subscriber's full buffer lets go of the lock.
+	done      chan struct{}
+	closeDone sync.Once
+}
+
+func newSubscriber() *subscriber {
+	return &subscriber{ch: make(chan Event, defaultChanBuffer), done: make(chan struct{})}
+}
+
+func (sub *subscriber) stop() {
+	sub.closeDone.Do(func() { close(sub.done) })
 }
 
 type Service struct {
@@ -38,10 +50,11 @@ func (s *Service) Subscribe(table string) (<-chan Event, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sub := &subscriber{ch: make(chan Event, defaultChanBuffer)}
+	sub := newSubscriber()
 	s.tableSubs[table] = append(s.tableSubs[table], sub)
 
 	unsub := func() {
+		sub.stop()
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		subs := s.tableSubs[table]
@@ -63,10 +76,11 @@ func (s *Service) SubscribeAll() (<-chan Event, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sub := &subscriber{ch: make(chan Event, defaultChanBuffer)}
+	sub := newSubscriber()
 	s.globalSubs = append(s.globalSubs, sub)
 
 	unsub := func() {
+		sub.stop()
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		for i, existing := range s.globalSubs {
@@ -138,6 +152,8 @@ func (s *Service) deliver(sub *subscriber, event Event, kind, table string) {
 	for {
 		select {
 		case sub.ch <- event:
+			return
+		case <-sub.done:
 			return
 		case <-time.After(100 * time.Millisecond):
 			if s.closed.Load() {

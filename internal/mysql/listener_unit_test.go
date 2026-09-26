@@ -7,6 +7,10 @@ import (
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/config"
+	"github.com/go-mysql-org/go-mysql/canal"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
+	"github.com/go-mysql-org/go-mysql/schema"
 )
 
 func TestNewListenerWithoutOffsetFile(t *testing.T) {
@@ -106,5 +110,49 @@ func TestEventHandlerCurrentBinlogFile(t *testing.T) {
 	h.currentFile = "mysql-bin.000001"
 	if got := h.currentBinlogFile(); got != "mysql-bin.000001" {
 		t.Errorf("got %q", got)
+	}
+}
+
+// Every row of one binlog rows event shares its position, so the row index
+// makes each source id unique; replaying the binlog yields the same ids.
+func TestRowsGetPositionPlusRowIndexSourceIDs(t *testing.T) {
+	svc := cdc.NewService()
+	defer svc.Shutdown()
+	ch, unsub := svc.SubscribeAll()
+	defer unsub()
+	h := &eventHandler{service: svc, currentFile: "mysql-bin.000003"}
+
+	rows := &canal.RowsEvent{
+		Table:  &schema.Table{Schema: "shop", Name: "orders", Columns: []schema.TableColumn{{Name: "id"}}},
+		Action: canal.InsertAction,
+		Rows:   [][]interface{}{{1}, {2}},
+		Header: &replication.EventHeader{LogPos: 4711},
+	}
+	for pass := 0; pass < 2; pass++ {
+		if err := h.OnRow(rows); err != nil {
+			t.Fatal(err)
+		}
+		for i, want := range []string{"mysql:mysql-bin.000003:4711:0", "mysql:mysql-bin.000003:4711:1"} {
+			if got := (<-ch).SourceID; got != want {
+				t.Errorf("pass %d row %d source id = %q, want %q", pass, i, got, want)
+			}
+		}
+	}
+}
+
+func TestDDLGetsAPositionSourceID(t *testing.T) {
+	svc := cdc.NewService()
+	defer svc.Shutdown()
+	ch, unsub := svc.SubscribeAll()
+	defer unsub()
+	h := &eventHandler{service: svc}
+
+	err := h.OnDDL(nil, gomysql.Position{Name: "mysql-bin.000003", Pos: 900},
+		&replication.QueryEvent{Schema: []byte("shop"), Query: []byte("ALTER TABLE orders ADD c INT")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := (<-ch).SourceID; got != "mysql:mysql-bin.000003:900:ddl" {
+		t.Errorf("DDL source id = %q", got)
 	}
 }

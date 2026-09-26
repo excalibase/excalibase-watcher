@@ -3,6 +3,7 @@ package health
 import (
 	"encoding/json"
 	"net/http"
+	"slices"
 )
 
 type Status struct {
@@ -12,16 +13,37 @@ type Status struct {
 	Reason        string `json:"reason,omitempty"`
 }
 
+type readyBody struct {
+	Status string `json:"status"`
+	Reason string `json:"reason,omitempty"`
+}
+
+type readinessCheck struct {
+	reason string
+	ready  func() bool
+}
+
 type Checker struct {
 	isRunning    func() bool
 	subscriberFn func() int
+	readiness    []readinessCheck
 }
+
+const listenerNotRunning = "CDC listener not running"
 
 func NewChecker(isRunning func() bool, subscriberFn func() int) *Checker {
 	return &Checker{
 		isRunning:    isRunning,
 		subscriberFn: subscriberFn,
 	}
+}
+
+// WithReadiness returns a checker that also reports not ready, with reason,
+// while ready is false. Liveness is unaffected.
+func (c *Checker) WithReadiness(reason string, ready func() bool) *Checker {
+	next := *c
+	next.readiness = append(slices.Clone(c.readiness), readinessCheck{reason: reason, ready: ready})
+	return &next
 }
 
 func (c *Checker) HealthHandler(w http.ResponseWriter, r *http.Request) {
@@ -36,7 +58,7 @@ func (c *Checker) HealthHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	} else {
 		status.Status = "DOWN"
-		status.Reason = "CDC listener not running"
+		status.Reason = listenerNotRunning
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}
 
@@ -45,11 +67,24 @@ func (c *Checker) HealthHandler(w http.ResponseWriter, r *http.Request) {
 
 func (c *Checker) ReadyHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	if c.isRunning() {
+	reason := c.notReadyReason()
+	if reason == "" {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ready"}`))
-	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"status":"not ready"}`))
+		json.NewEncoder(w).Encode(readyBody{Status: "ready"})
+		return
 	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	json.NewEncoder(w).Encode(readyBody{Status: "not ready", Reason: reason})
+}
+
+func (c *Checker) notReadyReason() string {
+	if !c.isRunning() {
+		return listenerNotRunning
+	}
+	for _, check := range c.readiness {
+		if !check.ready() {
+			return check.reason
+		}
+	}
+	return ""
 }

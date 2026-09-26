@@ -1,6 +1,8 @@
 package cdc
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -39,5 +41,18 @@ func TestEventTypeString(t *testing.T) {
 		if got := tp.String(); got != want {
 			t.Errorf("EventType(%d).String() = %q, want %q", tp, got, want)
 		}
+	}
+}
+
+// SourceID is the publisher's dedupe key, not part of the consumer payload.
+func TestSourceIDIsNotInThePayload(t *testing.T) {
+	event := NewEvent(Insert, "public", "users", `{"id":1}`, "INSERT", "0/1")
+	event.SourceID = "pg:0/1:0"
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "pg:0/1:0") {
+		t.Errorf("payload carries the source id: %s", data)
 	}
 }

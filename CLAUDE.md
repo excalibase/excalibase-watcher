@@ -104,6 +104,8 @@ See `docs/JAVA_PARITY.md` for the full list.
 
 - **`CreateOrUpdateStream` CLOBBERS existing subjects list.** See invariant #1. This is the single most painful bug I've seen — works fine with one watcher, silently breaks when you add a second.
 - **Consumer `DeliverPolicy.New`** is the default you want for live CDC tests; `DeliverAllPolicy` for "catch up from the start of the stream" tests (e.g. snapshot tests, resume-from-offset tests).
+- **The client must never give up on its own.** An unreachable server, at boot or later, is retried forever; without `RetryOnFailedConnect` an unreachable server at boot would exit the process. An auth error means a misconfigured server and is not retried forever. `Start` therefore returns before the connection is up; `/readyz` stays 503 until connected with the stream verified, and a missing stream or a connection closed for good arrives on `Publisher.Failed()` so `main` still exits non-zero.
+- **`Nats-Msg-Id` is derived from the source position** (`<subject_prefix>/pg:<commit LSN>:<index in txn>`, `mysql:<file>:<pos>:<row>`), so a retry, a lost ack and a re-stream after restart all dedupe within the stream's duplicate window — which should therefore equal max-age. Snapshot rows have no position and only dedupe their own retries. Publishes are not buffered while disconnected (`ReconnectBufSize(-1)`).
 - **Stream config retention=`limits`** with `discard=old` means: when disk/msg/age limits are hit, oldest events are discarded. Subscribers must either be fast enough or keep up via durable consumer state.
 
 ### Testing
@@ -159,6 +161,8 @@ internal/
     snapshot_dump.go             # mysqldump INSERT parser
   nats/
     publisher.go                 # JetStream publisher, LastAckedLSN tracking
+    connection.go                # never-give-up connect options, jittered backoff, readiness
+  natstest/                      # (integration tag) in-process NATS that can be taken down and brought back
   jsonutil/escape.go             # Shared RFC 8259 JSON string escape
   config/config.go               # Viper YAML + env var
   health/health.go               # HTTP /healthz /readyz
