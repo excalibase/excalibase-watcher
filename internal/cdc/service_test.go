@@ -182,13 +182,30 @@ func TestRejectInvalidJsonData(t *testing.T) {
 
 	// Invalid JSON data (not starting with { and ending with })
 	event := NewEvent(Insert, "public", "users", "not json", "INSERT", "0/1")
-	svc.HandleEvent(event)
+	if svc.HandleEvent(event) {
+		t.Error("HandleEvent reported a rejected event as accepted")
+	}
 
 	select {
 	case <-ch:
 		t.Error("should not receive event with invalid JSON data")
 	case <-time.After(100 * time.Millisecond):
 		// expected — event rejected
+	}
+}
+
+func TestHandleEventReportsAcceptance(t *testing.T) {
+	svc := NewService()
+	ch, unsub := svc.SubscribeAll()
+	defer unsub()
+
+	if !svc.HandleEvent(NewEvent(Insert, "public", "users", `{"id":1}`, "INSERT", "0/1")) {
+		t.Error("valid event reported as rejected")
+	}
+	<-ch
+	svc.Shutdown()
+	if svc.HandleEvent(NewEvent(Insert, "public", "users", `{"id":2}`, "INSERT", "0/2")) {
+		t.Error("event after shutdown reported as accepted")
 	}
 }
 

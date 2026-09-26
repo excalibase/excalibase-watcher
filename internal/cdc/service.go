@@ -94,9 +94,11 @@ func (s *Service) SubscribeAll() (<-chan Event, func()) {
 	return sub.ch, unsub
 }
 
-func (s *Service) HandleEvent(event Event) {
+// HandleEvent passes an event to every subscriber and reports whether it was
+// accepted: false when the service is shut down or the event is invalid.
+func (s *Service) HandleEvent(event Event) bool {
 	if s.closed.Load() {
-		return
+		return false
 	}
 
 	// Validate JSON data for DML events only (DDL data is raw SQL, not JSON)
@@ -105,7 +107,7 @@ func (s *Service) HandleEvent(event Event) {
 			"type", event.Type.String(),
 			"table", event.Table,
 		)
-		return
+		return false
 	}
 
 	metrics.IncEvent(event.Type.String())
@@ -124,6 +126,7 @@ func (s *Service) HandleEvent(event Event) {
 			s.deliver(sub, event, "table", event.Table)
 		}
 	}
+	return true
 }
 
 // deliver sends an event to a subscriber, blocking if the channel is full.
