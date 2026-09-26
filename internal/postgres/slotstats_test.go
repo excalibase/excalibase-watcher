@@ -138,6 +138,112 @@ func TestSamplerRunKeepsGoingAfterQueryError(t *testing.T) {
 	}
 }
 
+func TestSampleOncePublishesWALStatusAndSafeSize(t *testing.T) {
+	sampler := newSlotSampler(time.Hour, newLagTracker(time.Now), func(context.Context) (SlotStats, error) {
+		return SlotStats{WALStatus: "unreserved", SafeWALBytes: 4096}, nil
+	})
+
+	if err := sampler.sampleOnce(context.Background()); err != nil {
+		t.Fatalf("sampleOnce: %v", err)
+	}
+
+	assertGauge(t, "wal_status unreserved", metrics.SlotWALStatus.WithLabelValues("unreserved"), 1)
+	assertGauge(t, "wal_status reserved", metrics.SlotWALStatus.WithLabelValues("reserved"), 0)
+	assertGauge(t, "wal_status lost", metrics.SlotWALStatus.WithLabelValues("lost"), 0)
+	assertGauge(t, "cdc_slot_safe_wal_bytes", metrics.SlotSafeWALBytes, 4096)
+	if !sampler.SlotUsable() {
+		t.Error("an unreserved slot still streams")
+	}
+}
+
+func TestSamplerReportsAnInvalidatedSlotUnusable(t *testing.T) {
+	status := "reserved"
+	sampler := newSlotSampler(time.Hour, newLagTracker(time.Now), func(context.Context) (SlotStats, error) {
+		return SlotStats{WALStatus: status, SafeWALBytes: -1}, nil
+	})
+	if !sampler.SlotUsable() {
+		t.Fatal("usable before the first sample")
+	}
+
+	status = "lost"
+	if err := sampler.sampleOnce(context.Background()); err != nil {
+		t.Fatalf("sampleOnce: %v", err)
+	}
+	if sampler.SlotUsable() {
+		t.Error("a lost slot must be reported unusable")
+	}
+	assertGauge(t, "wal_status lost", metrics.SlotWALStatus.WithLabelValues("lost"), 1)
+	assertGauge(t, "cdc_slot_safe_wal_bytes", metrics.SlotSafeWALBytes, -1)
+}
+
+func TestSamplerReportsAMissingSlotUnusable(t *testing.T) {
+	sampler := newSlotSampler(time.Hour, newLagTracker(time.Now), func(context.Context) (SlotStats, error) {
+		return SlotStats{}, errSlotMissing
+	})
+
+	if err := sampler.sampleOnce(context.Background()); err == nil {
+		t.Fatal("expected an error for a missing slot")
+	}
+	if sampler.SlotUsable() {
+		t.Error("a dropped slot must be reported unusable")
+	}
+}
+
+func TestSamplerKeepsLastVerdictOnQueryError(t *testing.T) {
+	fail := false
+	sampler := newSlotSampler(time.Hour, newLagTracker(time.Now), func(context.Context) (SlotStats, error) {
+		if fail {
+			return SlotStats{}, errors.New("connection refused")
+		}
+		return SlotStats{WALStatus: "lost"}, nil
+	})
+	_ = sampler.sampleOnce(context.Background())
+	fail = true
+	_ = sampler.sampleOnce(context.Background())
+
+	if sampler.SlotUsable() {
+		t.Error("an unreachable database must not clear a lost verdict")
+	}
+}
+
+func TestSamplerClearsItsVerdictOnceTheSlotIsHealthyAgain(t *testing.T) {
+	status := "lost"
+	sampler := newSlotSampler(time.Hour, newLagTracker(time.Now), func(context.Context) (SlotStats, error) {
+		return SlotStats{WALStatus: status}, nil
+	})
+	_ = sampler.sampleOnce(context.Background())
+	status = "reserved"
+	_ = sampler.sampleOnce(context.Background())
+
+	if !sampler.SlotUsable() {
+		t.Error("a recreated, healthy slot must be reported usable")
+	}
+}
+
+func TestSlotNeedsRecreating(t *testing.T) {
+	cases := []struct {
+		name    string
+		stats   SlotStats
+		err     error
+		want    bool
+		wantErr bool
+	}{
+		{"healthy", SlotStats{WALStatus: "reserved"}, nil, false, false},
+		{"near the cap", SlotStats{WALStatus: "unreserved"}, nil, false, false},
+		{"invalidated", SlotStats{WALStatus: "lost"}, nil, true, false},
+		{"dropped", SlotStats{}, errSlotMissing, true, false},
+		{"database unreachable", SlotStats{}, errors.New("connection refused"), false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := slotNeedsRecreating(c.stats, c.err)
+			if got != c.want || (err != nil) != c.wantErr {
+				t.Errorf("slotNeedsRecreating = %v, %v; want %v, error %v", got, err, c.want, c.wantErr)
+			}
+		})
+	}
+}
+
 func assertGauge(t *testing.T, name string, collector prometheus.Collector, want float64) {
 	t.Helper()
 	got := testutil.ToFloat64(collector)

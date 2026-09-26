@@ -42,7 +42,12 @@ func createPublicationIfNotExists(ctx context.Context, conn *pgx.Conn, pubName s
 	return nil
 }
 
-func createReplicationSlotIfNotExists(ctx context.Context, conn *pgx.Conn, slotName string) error {
+type slotAdmin interface {
+	rowQuerier
+	execer
+}
+
+func createReplicationSlotIfNotExists(ctx context.Context, conn slotAdmin, slotName string) error {
 	if err := validateIdentifier(slotName); err != nil {
 		return err
 	}

@@ -18,7 +18,21 @@ import (
 
 func setupPostgres(t *testing.T) (string, func()) {
 	t.Helper()
+	return setupPostgresWith(t)
+}
+
+// setupPostgresWith starts Postgres with extra server settings ("name=value").
+func setupPostgresWith(t *testing.T, settings ...string) (string, func()) {
+	t.Helper()
 	ctx := context.Background()
+	args := []string{
+		"-c", "wal_level=logical",
+		"-c", "max_replication_slots=5",
+		"-c", "max_wal_senders=5",
+	}
+	for _, setting := range settings {
+		args = append(args, "-c", setting)
+	}
 
 	container, err := tcpostgres.Run(ctx,
 		"postgres:16-alpine",
@@ -28,11 +42,7 @@ func setupPostgres(t *testing.T) (string, func()) {
 		tcpostgres.WithInitScripts(), // no init scripts
 		testcontainers.CustomizeRequest(testcontainers.GenericContainerRequest{
 			ContainerRequest: testcontainers.ContainerRequest{
-				Cmd: []string{
-					"-c", "wal_level=logical",
-					"-c", "max_replication_slots=5",
-					"-c", "max_wal_senders=5",
-				},
+				Cmd: args,
 			},
 		}),
 		testcontainers.WithWaitStrategy(

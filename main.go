@@ -60,17 +60,22 @@ func run() error {
 	// for its database alive, and not ready, instead of restarting it.
 	var starting atomic.Bool
 	starting.Store(true)
-	server := startHTTPServer(cfg, service, pub, starting.Load)
+	var pgListener atomic.Pointer[pglistener.Listener]
+	server := startHTTPServer(cfg, service, pub, starting.Load, func() bool {
+		listener := pgListener.Load()
+		return listener == nil || listener.SlotUsable()
+	})
 
-	stopPG, err := startPostgres(ctx, cfg, service, pub)
+	listener, err := startPostgres(ctx, cfg, service, pub)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
 		return err
 	}
-	if stopPG != nil {
-		defer stopPG()
+	if listener != nil {
+		pgListener.Store(listener)
+		defer listener.Stop()
 	}
 
 	stopMySQL, err := startMySQL(ctx, cfg, service, pub)
@@ -108,7 +113,7 @@ func startNATS(ctx context.Context, cfg *config.Config, service *cdc.Service) (*
 	return pub, pub.Stop, nil
 }
 
-func startPostgres(ctx context.Context, cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher) (func(), error) {
+func startPostgres(ctx context.Context, cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher) (*pglistener.Listener, error) {
 	if !cfg.Postgres.Enabled {
 		return nil, nil
 	}
@@ -126,7 +131,7 @@ func startPostgres(ctx context.Context, cfg *config.Config, service *cdc.Service
 	}
 	service.MarkRunning()
 	slog.Info("PostgreSQL CDC listener started")
-	return pgListener.Stop, nil
+	return pgListener, nil
 }
 
 func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher) (func(), error) {
@@ -148,8 +153,11 @@ func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, p
 	return mysqlListener.Stop, nil
 }
 
-func startHTTPServer(cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher, isStarting func() bool) *http.Server {
-	checker := health.NewChecker(service.IsRunning, service.TotalSubscriberCount).WithStartup(isStarting)
+func startHTTPServer(cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher,
+	isStarting, slotUsable func() bool) *http.Server {
+	checker := health.NewChecker(service.IsRunning, service.TotalSubscriberCount).
+		WithStartup(isStarting).
+		WithReadiness("replication slot dropped or invalidated", slotUsable)
 	if pub != nil {
 		checker = checker.WithReadiness("NATS not connected", pub.Ready)
 	}
