@@ -8,7 +8,12 @@ starts. Recommended one-time setup:
     --subjects='{{ .Values.nats.subjectPrefix }}.>' \
     --storage=file --retention=limits \
     --max-age={{ .Values.nats.maxAgeMinutes }}m --discard=old \
+    --dupe-window={{ .Values.nats.maxAgeMinutes }}m \
     --replicas=3 --defaults
+
+The duplicate window should equal max-age: the watcher derives each message
+id from the source position, so a change re-published after an outage or a
+restart is dropped for as long as the window covers it.
 
 For multi-tenant deployments, the stream uses a wildcard that covers all
 tenants (e.g. subjects=['cdc.>']). Each tenant's watcher uses a unique

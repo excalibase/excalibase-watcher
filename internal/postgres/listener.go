@@ -40,8 +40,11 @@ type Listener struct {
 	schemaStore schema.HistoryStore
 	lag         *lagTracker
 	ack         *ackGate
-	registry    *slotRegistry
-	cleaner     *slotCleaner
+	// txnIndex numbers the publishable events of the current transaction;
+	// with its commit LSN it names each change the same way on every re-stream.
+	txnIndex int
+	registry *slotRegistry
+	cleaner  *slotCleaner
 
 	conn *pgconn.PgConn
 	// maintenance serves slot-stat sampling; separate from the replication
@@ -101,7 +104,12 @@ func (l *Listener) PublishedObserver() func(cdc.Event) {
 // emit hands an event to the bus, remembering the position of publishable
 // events so the standby status can be held back until NATS acks them.
 func (l *Listener) emit(event cdc.Event) {
+	if event.Type == cdc.Begin {
+		l.txnIndex = 0
+	}
 	if cdc.IsPublishable(event.Type) {
+		event.SourceID = fmt.Sprintf("pg:%s:%d", l.parser.TransactionLSN(), l.txnIndex)
+		l.txnIndex++
 		if lsn, err := pglogrepl.ParseLSN(event.LSN); err == nil {
 			l.ack.Handed(lsn)
 		}

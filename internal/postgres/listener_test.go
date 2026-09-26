@@ -112,9 +112,9 @@ func drainUntilType(t *testing.T, ch <-chan cdc.Event, typ cdc.EventType, timeou
 			}
 		case <-deadline:
 			t.Fatalf("timeout waiting for event type %v", typ)
+			return cdc.Event{}
 		}
 	}
-	return cdc.Event{} // unreachable
 }
 
 func TestCaptureInsert(t *testing.T) {

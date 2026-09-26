@@ -11,6 +11,7 @@ import (
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/jsonutil"
 	"github.com/excalibase/watcher-go/internal/schema"
+	"github.com/jackc/pglogrepl"
 )
 
 // PostgreSQL epoch: 2000-01-01 00:00:00 UTC in Unix epoch millis
@@ -59,6 +60,7 @@ type Parser struct {
 	relationMap  map[uint32]*RelationInfo
 	eventHandler func(cdc.Event) // for multi-event messages (TRUNCATE)
 	lsnProvider  func() string   // optional: provides current LSN for schema history
+	txnFinalLSN  pglogrepl.LSN
 }
 
 func NewParser(tableFilter map[string]struct{}, captureDDL bool, schemaStore schema.HistoryStore) *Parser {
@@ -72,6 +74,12 @@ func NewParser(tableFilter map[string]struct{}, captureDDL bool, schemaStore sch
 
 func (p *Parser) SetEventHandler(h func(cdc.Event)) {
 	p.eventHandler = h
+}
+
+// TransactionLSN is the commit LSN of the transaction being decoded, from its
+// BEGIN; it is the same whenever the transaction is streamed again.
+func (p *Parser) TransactionLSN() pglogrepl.LSN {
+	return p.txnFinalLSN
 }
 
 func (p *Parser) SetLSNProvider(fn func() string) {
@@ -109,7 +117,7 @@ func (p *Parser) Parse(data []byte, lsn string) *cdc.Event {
 
 func (p *Parser) parseBegin(buf *reader, lsn string) *cdc.Event {
 	if buf.remaining() >= 20 {
-		buf.readUint64() // finalLSN — skip
+		p.txnFinalLSN = pglogrepl.LSN(buf.readUint64())
 		pgMicros := buf.readUint64()
 		sourceTS := pgEpochOffsetMillis + int64(pgMicros/1000)
 		buf.readUint32() // xid — skip

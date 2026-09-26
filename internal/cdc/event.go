@@ -83,6 +83,9 @@ type Event struct {
 	LSN             string    `json:"lsn,omitempty"`
 	Timestamp       int64     `json:"timestamp"`
 	SourceTimestamp int64     `json:"sourceTimestamp"`
+	// SourceID identifies the change at its source (same value on every
+	// re-read), so the publisher can dedupe; empty when there is no position.
+	SourceID string `json:"-"`
 }
 
 func NewEvent(typ EventType, schema, table, data, rawMessage, lsn string) Event {

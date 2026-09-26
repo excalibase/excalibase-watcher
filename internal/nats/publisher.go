@@ -16,15 +16,21 @@ import (
 	"github.com/excalibase/watcher-go/internal/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/nats-io/nuid"
 )
 
 type Publisher struct {
 	cfg     config.NATSConfig
 	service *cdc.Service
-	conn    *nats.Conn
+	conn    atomic.Pointer[nats.Conn]
 	js      jetstream.JetStream
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
+
+	streamVerified atomic.Bool
+	stopping       atomic.Bool
+	failed         chan error
+	reconnect      backoff
 
 	// lastAckedLSN is updated after every successful js.Publish ack.
 	// Offset-persisting listeners read this to advance storage safely.
@@ -32,7 +38,7 @@ type Publisher struct {
 	onPublished  atomic.Pointer[func(cdc.Event)]
 
 	// publishFn performs one publish attempt; tests substitute a fake.
-	publishFn      func(ctx context.Context, subject string, data []byte) error
+	publishFn      func(ctx context.Context, subject string, data []byte, msgID string) error
 	retryBaseDelay time.Duration
 }
 
@@ -46,6 +52,8 @@ func NewPublisher(cfg config.NATSConfig, service *cdc.Service) *Publisher {
 		cfg:            cfg,
 		service:        service,
 		retryBaseDelay: defaultRetryBaseDelay,
+		failed:         make(chan error, 1),
+		reconnect:      defaultBackoff(),
 	}
 	p.lastAckedLSN.Store("")
 	return p
@@ -65,31 +73,37 @@ func (p *Publisher) SetOnPublished(fn func(cdc.Event)) {
 	p.onPublished.Store(&fn)
 }
 
-// connectOptions turns the configured credential into dial options. A NATS
-// server that scopes permissions per principal also scopes the reply inbox,
-// so the prefix travels with the credential.
-func connectOptions(cfg config.NATSConfig) []nats.Option {
-	opts := []nats.Option{
-		nats.ReconnectWait(2 * time.Second),
-		nats.MaxReconnects(-1),
-	}
-	if cfg.Username != "" {
-		opts = append(opts, nats.UserInfo(cfg.Username, cfg.Password))
-	}
-	if cfg.InboxPrefix != "" {
-		opts = append(opts, nats.CustomInboxPrefix(cfg.InboxPrefix))
-	}
-	return opts
+// Ready reports whether events can be published right now: connected, with
+// the stream verified.
+func (p *Publisher) Ready() bool {
+	conn := p.conn.Load()
+	return conn != nil && conn.IsConnected() && p.streamVerified.Load()
 }
 
+// Failed delivers the error that makes the publisher unable to continue: the
+// stream is missing, or the connection closed for good.
+func (p *Publisher) Failed() <-chan error {
+	return p.failed
+}
+
+func (p *Publisher) fail(err error) {
+	select {
+	case p.failed <- err:
+	default:
+	}
+}
+
+// Start returns once the connection is being attempted, not once it is up:
+// NATS being unreachable at boot is transient, and the
+// events meanwhile wait on the bus subscription taken here.
 func (p *Publisher) Start(ctx context.Context) error {
 	ctx, p.cancel = context.WithCancel(ctx)
 
-	conn, err := nats.Connect(p.cfg.URL, connectOptions(p.cfg)...)
+	conn, err := nats.Connect(p.cfg.URL, p.connectOptions()...)
 	if err != nil {
 		return fmt.Errorf("connecting to NATS: %w", err)
 	}
-	p.conn = conn
+	p.conn.Store(conn)
 
 	js, err := jetstream.New(conn)
 	if err != nil {
@@ -97,23 +111,31 @@ func (p *Publisher) Start(ctx context.Context) error {
 		return fmt.Errorf("creating JetStream: %w", err)
 	}
 	p.js = js
-	p.publishFn = func(ctx context.Context, subject string, data []byte) error {
-		_, err := js.Publish(ctx, subject, data)
+	p.publishFn = func(ctx context.Context, subject string, data []byte, msgID string) error {
+		_, err := js.Publish(ctx, subject, data, jetstream.WithMsgID(msgID))
 		return err
 	}
 
-	// Create or update stream (idempotent)
-	if err := p.ensureStream(ctx); err != nil {
+	if err := p.verifyStreamIfConnected(ctx, conn); err != nil {
 		conn.Close()
 		return err
 	}
 
-	// Subscribe to all CDC events and publish to NATS
 	ch, unsub := p.service.SubscribeAll()
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
 		defer unsub()
+		if p.streamVerified.Load() {
+			p.publishLoop(ctx, ch)
+			return
+		}
+		if err := p.awaitStream(ctx, conn); err != nil {
+			if ctx.Err() == nil {
+				p.fail(err)
+			}
+			return
+		}
 		p.publishLoop(ctx, ch)
 	}()
 
@@ -121,15 +143,58 @@ func (p *Publisher) Start(ctx context.Context) error {
 }
 
 func (p *Publisher) Stop() {
+	p.stopping.Store(true)
 	if p.cancel != nil {
 		p.cancel()
 	}
 	p.wg.Wait()
-	if p.conn != nil {
-		p.conn.Close()
-		p.conn = nil
+	if conn := p.conn.Load(); conn != nil {
+		conn.Close()
 	}
 }
+
+// verifyStreamIfConnected fails Start on a missing stream when the first
+// login was accepted, before any database listener starts. Other lookup
+// errors are left to awaitStream to retry.
+func (p *Publisher) verifyStreamIfConnected(ctx context.Context, conn *nats.Conn) error {
+	if !conn.IsConnected() {
+		return nil
+	}
+	err := p.ensureStream(ctx)
+	if err == nil {
+		p.streamVerified.Store(true)
+	}
+	if errors.Is(err, errStreamMissing) {
+		return err
+	}
+	return nil
+}
+
+// awaitStream verifies the stream once connected. A missing stream is fatal;
+// any other lookup error is retried, since the connection can drop again
+// between connecting and asking.
+func (p *Publisher) awaitStream(ctx context.Context, conn *nats.Conn) error {
+	for attempt := 1; ; attempt++ {
+		if err := p.waitConnected(ctx, conn); err != nil {
+			return err
+		}
+		err := p.ensureStream(ctx)
+		if err == nil {
+			p.streamVerified.Store(true)
+			return nil
+		}
+		if errors.Is(err, errStreamMissing) || ctx.Err() != nil {
+			return err
+		}
+		delay := p.reconnect.delay(attempt)
+		slog.Warn("verifying NATS stream failed, retrying", "retry_in", delay, "error", err)
+		if err := sleepContext(ctx, delay); err != nil {
+			return err
+		}
+	}
+}
+
+var errStreamMissing = errors.New("NATS stream does not exist")
 
 // ensureStream verifies the JetStream stream exists. The watcher NEVER
 // creates or modifies the stream — it is a pure publisher.
@@ -160,10 +225,10 @@ func (p *Publisher) ensureStream(ctx context.Context) error {
 		return nil
 	}
 	if errors.Is(err, jetstream.ErrStreamNotFound) {
-		return fmt.Errorf("NATS stream %q does not exist — provision it before starting "+
+		return fmt.Errorf("%w: %q — provision it before starting "+
 			"the watcher (e.g. `nats stream add %s --subjects='cdc.>'`). The watcher is "+
 			"a pure publisher and will not create or modify streams",
-			p.cfg.StreamName, p.cfg.StreamName)
+			errStreamMissing, p.cfg.StreamName, p.cfg.StreamName)
 	}
 	return fmt.Errorf("looking up NATS stream %q: %w", p.cfg.StreamName, err)
 }
@@ -175,16 +240,30 @@ func (p *Publisher) publishLoop(ctx context.Context, ch <-chan cdc.Event) {
 			if !ok {
 				return
 			}
-			if !shouldPublish(event.Type) {
-				continue
-			}
-			if err := p.publish(ctx, event); err != nil && ctx.Err() == nil {
-				slog.Warn("giving up on event", "type", event.Type.String(), "error", err)
+			if !p.deliver(ctx, event) {
+				return
 			}
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// deliver publishes one event and reports whether the loop may continue. A
+// closed connection stops it: skipping ahead would let later acks confirm the
+// source position past this event.
+func (p *Publisher) deliver(ctx context.Context, event cdc.Event) bool {
+	if !shouldPublish(event.Type) {
+		return true
+	}
+	err := p.publish(ctx, event)
+	if errors.Is(err, errConnectionClosed) {
+		return false
+	}
+	if err != nil && ctx.Err() == nil {
+		slog.Warn("giving up on event", "type", event.Type.String(), "error", err)
+	}
+	return true
 }
 
 // publish delivers one event to JetStream, retrying with backoff until the
@@ -199,7 +278,7 @@ func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 		return fmt.Errorf("marshaling event: %w", err)
 	}
 
-	if err := p.publishWithRetry(ctx, subject, data, event.Type.String()); err != nil {
+	if err := p.publishWithRetry(ctx, subject, data, p.messageID(event), event.Type.String()); err != nil {
 		return err
 	}
 
@@ -215,14 +294,35 @@ func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 	return nil
 }
 
-func (p *Publisher) publishWithRetry(ctx context.Context, subject string, data []byte, eventType string) error {
+// messageID is scoped by subject prefix because every tenant publishes into
+// one stream. Events with no source position (snapshot rows) cannot be
+// recognised when re-read, so they only dedupe their own retries.
+func (p *Publisher) messageID(event cdc.Event) string {
+	if event.SourceID == "" {
+		return nuid.Next()
+	}
+	return p.cfg.SubjectPrefix + "/" + event.SourceID
+}
+
+// publishWithRetry sends every attempt with the same message id: an attempt
+// whose ack was lost may still have been stored, and the stream drops the
+// repeat within its duplicate window.
+func (p *Publisher) publishWithRetry(ctx context.Context, subject string, data []byte, msgID, eventType string) error {
 	delay := p.retryBaseDelay
 	for {
-		err := p.publishFn(ctx, subject, data)
+		err := p.publishFn(ctx, subject, data, msgID)
 		if err == nil {
 			return nil
 		}
 		metrics.IncNATSError()
+		if p.connectionLost() {
+			// The connection layer logs its own retries; waiting here keeps
+			// one line per attempt instead of one per attempt per event.
+			if err := p.waitConnected(ctx, p.conn.Load()); err != nil {
+				return err
+			}
+			continue
+		}
 		slog.Warn("publish failed, retrying", "type", eventType, "delay", delay, "error", err)
 		select {
 		case <-ctx.Done():

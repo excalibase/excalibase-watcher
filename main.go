@@ -71,10 +71,10 @@ func run() error {
 		defer stopMySQL()
 	}
 
-	server := startHTTPServer(cfg, service)
+	server := startHTTPServer(cfg, service, pub)
 
 	slog.Info("excalibase-watcher started")
-	waitForShutdown()
+	runErr := waitForShutdown(publisherFailures(pub))
 
 	slog.Info("shutting down...")
 	cancel()
@@ -84,7 +84,7 @@ func run() error {
 		slog.Warn("HTTP server shutdown error", "error", err)
 	}
 
-	return nil
+	return runErr
 }
 
 func startNATS(ctx context.Context, cfg *config.Config, service *cdc.Service) (*natsPublisher.Publisher, func(), error) {
@@ -95,7 +95,7 @@ func startNATS(ctx context.Context, cfg *config.Config, service *cdc.Service) (*
 	if err := pub.Start(ctx); err != nil {
 		return nil, nil, fmt.Errorf("starting NATS publisher: %w", err)
 	}
-	slog.Info("NATS JetStream publisher started")
+	slog.Info("NATS JetStream publisher started; connecting in the background")
 	return pub, pub.Stop, nil
 }
 
@@ -139,8 +139,11 @@ func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, p
 	return mysqlListener.Stop, nil
 }
 
-func startHTTPServer(cfg *config.Config, service *cdc.Service) *http.Server {
+func startHTTPServer(cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher) *http.Server {
 	checker := health.NewChecker(service.IsRunning, service.TotalSubscriberCount)
+	if pub != nil {
+		checker = checker.WithReadiness("NATS not connected", pub.Ready)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", checker.HealthHandler)
@@ -167,10 +170,23 @@ func startHTTPServer(cfg *config.Config, service *cdc.Service) *http.Server {
 	return server
 }
 
-func waitForShutdown() {
+// publisherFailures is nil without a publisher; receiving from it blocks forever.
+func publisherFailures(pub *natsPublisher.Publisher) <-chan error {
+	if pub == nil {
+		return nil
+	}
+	return pub.Failed()
+}
+
+func waitForShutdown(failures <-chan error) error {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	select {
+	case <-sigCh:
+		return nil
+	case err := <-failures:
+		return fmt.Errorf("NATS publisher: %w", err)
+	}
 }
 
 func main() {

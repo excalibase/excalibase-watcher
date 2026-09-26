@@ -79,3 +79,35 @@ func TestDeliverReturnsOnShutdown(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A subscriber that stops reading (publisher shutting down while NATS is
+// unreachable) must be able to unsubscribe even while a producer is blocked
+// delivering to its full buffer; otherwise shutdown deadlocks.
+func TestUnsubscribeReleasesAProducerBlockedOnAFullBuffer(t *testing.T) {
+	svc := NewService()
+	_, unsub := svc.SubscribeAll()
+	for i := 0; i < defaultChanBuffer; i++ {
+		svc.HandleEvent(NewEvent(Insert, "public", "users", `{"id":1}`, "INSERT", ""))
+	}
+
+	produced := make(chan struct{})
+	go func() {
+		svc.HandleEvent(NewEvent(Insert, "public", "users", `{"id":2}`, "INSERT", ""))
+		close(produced)
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	unsubscribed := make(chan struct{})
+	go func() {
+		unsub()
+		close(unsubscribed)
+	}()
+	for name, done := range map[string]chan struct{}{"unsubscribe": unsubscribed, "blocked producer": produced} {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s never returned", name)
+		}
+	}
+	unsub()
+}
