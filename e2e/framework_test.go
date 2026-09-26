@@ -125,8 +125,8 @@ func startWatcherWithoutStreamProvision(t *testing.T, cfgYAML string) *watcherPr
 }
 
 // startWatcherRaw starts the binary; waitForHealthReady toggles whether we
-// wait for /healthz to respond 200 (normal tests) or return immediately
-// (fail-fast tests).
+// wait for /readyz to respond 200 (normal tests) or return immediately
+// (fail-fast tests). /healthz answers 200 while the watcher is still starting.
 func startWatcherRaw(t *testing.T, cfgYAML string, waitForHealthReady bool) *watcherProcess {
 	t.Helper()
 
@@ -148,7 +148,7 @@ func startWatcherRaw(t *testing.T, cfgYAML string, waitForHealthReady bool) *wat
 	wp := &watcherProcess{cmd: cmd, cfgFile: cfgFile, cancel: cancel}
 
 	if waitForHealthReady {
-		healthURL := fmt.Sprintf("http://localhost:%d/healthz", healthPort)
+		healthURL := fmt.Sprintf("http://localhost:%d/readyz", healthPort)
 		waitForHealth(t, healthURL, 15*time.Second)
 	}
 

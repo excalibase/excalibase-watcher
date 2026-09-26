@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,8 +42,8 @@ func run() error {
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	service := cdc.NewService()
 	defer service.Shutdown()
@@ -55,8 +56,17 @@ func run() error {
 		defer stopPub()
 	}
 
+	// Serving health before the listeners start keeps a pod that is waiting
+	// for its database alive, and not ready, instead of restarting it.
+	var starting atomic.Bool
+	starting.Store(true)
+	server := startHTTPServer(cfg, service, pub, starting.Load)
+
 	stopPG, err := startPostgres(ctx, cfg, service, pub)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
 		return err
 	}
 	if stopPG != nil {
@@ -71,13 +81,12 @@ func run() error {
 		defer stopMySQL()
 	}
 
-	server := startHTTPServer(cfg, service, pub)
-
+	starting.Store(false)
 	slog.Info("excalibase-watcher started")
-	runErr := waitForShutdown(publisherFailures(pub))
+	runErr := waitForShutdown(ctx, publisherFailures(pub))
 
 	slog.Info("shutting down...")
-	cancel()
+	stop()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
@@ -139,8 +148,8 @@ func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, p
 	return mysqlListener.Stop, nil
 }
 
-func startHTTPServer(cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher) *http.Server {
-	checker := health.NewChecker(service.IsRunning, service.TotalSubscriberCount)
+func startHTTPServer(cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher, isStarting func() bool) *http.Server {
+	checker := health.NewChecker(service.IsRunning, service.TotalSubscriberCount).WithStartup(isStarting)
 	if pub != nil {
 		checker = checker.WithReadiness("NATS not connected", pub.Ready)
 	}
@@ -178,11 +187,9 @@ func publisherFailures(pub *natsPublisher.Publisher) <-chan error {
 	return pub.Failed()
 }
 
-func waitForShutdown(failures <-chan error) error {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+func waitForShutdown(ctx context.Context, failures <-chan error) error {
 	select {
-	case <-sigCh:
+	case <-ctx.Done():
 		return nil
 	case err := <-failures:
 		return fmt.Errorf("NATS publisher: %w", err)

@@ -27,6 +27,7 @@ type Checker struct {
 	isRunning    func() bool
 	subscriberFn func() int
 	readiness    []readinessCheck
+	isStarting   func() bool
 }
 
 const listenerNotRunning = "CDC listener not running"
@@ -46,6 +47,18 @@ func (c *Checker) WithReadiness(reason string, ready func() bool) *Checker {
 	return &next
 }
 
+// WithStartup returns a checker that reports alive but not ready while
+// isStarting is true, so waiting for a dependency is not a liveness failure.
+func (c *Checker) WithStartup(isStarting func() bool) *Checker {
+	next := *c
+	next.isStarting = isStarting
+	return &next
+}
+
+func (c *Checker) starting() bool {
+	return c.isStarting != nil && c.isStarting()
+}
+
 func (c *Checker) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	status := Status{
 		CDCEnabled:    true,
@@ -55,6 +68,9 @@ func (c *Checker) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if c.isRunning() {
 		status.Status = "UP"
+		w.WriteHeader(http.StatusOK)
+	} else if c.starting() {
+		status.Status = "STARTING"
 		w.WriteHeader(http.StatusOK)
 	} else {
 		status.Status = "DOWN"
