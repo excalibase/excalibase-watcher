@@ -101,18 +101,23 @@ func (l *Listener) PublishedObserver() func(cdc.Event) {
 	return l.ack.ObservePublished
 }
 
-// emit hands an event to the bus, remembering the position of publishable
-// events so the standby status can be held back until NATS acks them.
+// emit hands an event to the bus. Publishable events are numbered so the
+// standby status can be held back until NATS acks them.
 func (l *Listener) emit(event cdc.Event) {
-	if event.Type == cdc.Begin {
+	switch {
+	case event.Type == cdc.Begin:
 		l.txnIndex = 0
-	}
-	if cdc.IsPublishable(event.Type) {
+		l.ack.Begin()
+	case event.Type == cdc.Commit:
+		l.ack.Committed(l.parser.CommitEndLSN())
+	case cdc.IsPublishable(event.Type):
 		event.SourceID = fmt.Sprintf("pg:%s:%d", l.parser.TransactionLSN(), l.txnIndex)
 		l.txnIndex++
-		if lsn, err := pglogrepl.ParseLSN(event.LSN); err == nil {
-			l.ack.Handed(lsn)
+		event = l.ack.Hand(event)
+		if !l.service.HandleEvent(event) {
+			l.ack.Unhand()
 		}
+		return
 	}
 	l.service.HandleEvent(event)
 }
@@ -343,6 +348,7 @@ func (l *Listener) connectAndStream(ctx context.Context) error {
 		return err
 	}
 
+	l.ack.NewSession()
 	state := &replicationState{lastStatus: time.Now(), lastMessage: time.Now()}
 	l.parser.SetLSNProvider(func() string { return state.receivedLSN.String() })
 
@@ -371,17 +377,14 @@ func (l *Listener) connectAndStream(ctx context.Context) error {
 	return nil
 }
 
-// sendStatus confirms the ack-gated flush position to the primary. A zero
-// position (nothing acked yet in this session) is sent as-is: Postgres treats
-// it as "no progress" while still counting the message as a keepalive reply.
+// sendStatus confirms the ack-gated flush position to the primary: the end of
+// the last fully delivered commit, or an idle keepalive position. A zero
+// position (nothing confirmable yet in this process) is sent as-is: Postgres
+// treats it as "no progress" while still counting it as a keepalive reply.
 func (l *Listener) sendStatus(ctx context.Context, conn *pgconn.PgConn, state *replicationState) error {
-	flush := l.ack.FlushLSN(state.receivedLSN)
-	position := flush
-	if position > 0 {
-		position++ // Must add 1 for ack
-	}
+	flush := l.ack.Flush()
 	err := pglogrepl.SendStandbyStatusUpdate(ctx, conn,
-		pglogrepl.StandbyStatusUpdate{WALWritePosition: position})
+		pglogrepl.StandbyStatusUpdate{WALWritePosition: flush})
 	if err != nil {
 		return fmt.Errorf("send status: %w", err)
 	}
@@ -464,7 +467,8 @@ func (l *Listener) handleKeepalive(ctx context.Context, conn *pgconn.PgConn, dat
 	if !l.ack.Pending() {
 		l.lag.ObserveCaughtUp()
 	}
-	if !pkm.ReplyRequested && l.ack.FlushLSN(state.receivedLSN) == state.lastFlushSent {
+	l.ack.Idle(pkm.ServerWALEnd)
+	if !pkm.ReplyRequested && l.ack.Flush() == state.lastFlushSent {
 		return nil
 	}
 	return l.sendStatus(ctx, conn, state)

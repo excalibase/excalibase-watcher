@@ -86,6 +86,9 @@ type Event struct {
 	// SourceID identifies the change at its source (same value on every
 	// re-read), so the publisher can dedupe; empty when there is no position.
 	SourceID string `json:"-"`
+	// Sequence is the event's place in its listener's hand-off order, which
+	// is the order the publisher acks in; 0 when the listener does not gate.
+	Sequence uint64 `json:"-"`
 }
 
 func NewEvent(typ EventType, schema, table, data, rawMessage, lsn string) Event {

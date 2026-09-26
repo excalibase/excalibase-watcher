@@ -61,6 +61,7 @@ type Parser struct {
 	eventHandler func(cdc.Event) // for multi-event messages (TRUNCATE)
 	lsnProvider  func() string   // optional: provides current LSN for schema history
 	txnFinalLSN  pglogrepl.LSN
+	txnEndLSN    pglogrepl.LSN
 }
 
 func NewParser(tableFilter map[string]struct{}, captureDDL bool, schemaStore schema.HistoryStore) *Parser {
@@ -80,6 +81,12 @@ func (p *Parser) SetEventHandler(h func(cdc.Event)) {
 // BEGIN; it is the same whenever the transaction is streamed again.
 func (p *Parser) TransactionLSN() pglogrepl.LSN {
 	return p.txnFinalLSN
+}
+
+// CommitEndLSN is the end of the last decoded commit record: the position to
+// confirm once its transaction is delivered.
+func (p *Parser) CommitEndLSN() pglogrepl.LSN {
+	return p.txnEndLSN
 }
 
 func (p *Parser) SetLSNProvider(fn func() string) {
@@ -134,12 +141,13 @@ func (p *Parser) parseCommit(buf *reader, lsn string) *cdc.Event {
 	if buf.remaining() >= 25 {
 		buf.readByte()   // flags — unused
 		buf.readUint64() // commit LSN — skip
-		buf.readUint64() // end LSN — skip
+		p.txnEndLSN = pglogrepl.LSN(buf.readUint64())
 		pgMicros := buf.readUint64()
 		sourceTS := pgEpochOffsetMillis + int64(pgMicros/1000)
 		e := cdc.NewEventWithSourceTS(cdc.Commit, "", "", "", "COMMIT", lsn, sourceTS)
 		return &e
 	}
+	p.txnEndLSN = 0
 	e := cdc.NewEvent(cdc.Commit, "", "", "", "COMMIT", lsn)
 	return &e
 }

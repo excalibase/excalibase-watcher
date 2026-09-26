@@ -174,6 +174,9 @@ func TestParseCommit(t *testing.T) {
 	if event.SourceTimestamp != 946684802000 {
 		t.Errorf("commit sourceTimestamp = %d, want 946684802000", event.SourceTimestamp)
 	}
+	if got := p.CommitEndLSN(); got != 0x16B3DB8 {
+		t.Errorf("CommitEndLSN = %v, want the end LSN field 0/16B3DB8", got)
+	}
 }
 
 func TestParseCommitWithoutBodyStillEmitsEvent(t *testing.T) {
