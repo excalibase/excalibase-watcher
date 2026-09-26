@@ -269,16 +269,18 @@ func (p *Publisher) deliver(ctx context.Context, event cdc.Event) bool {
 // publish delivers one event to JetStream, retrying with backoff until the
 // broker acks or ctx ends. Skipping a failed event would let the source
 // position advance past it (see ackGate / offsetSaver) and lose it, so the
-// publisher blocks instead: the database retains WAL/binlog meanwhile.
+// publisher blocks instead: the database retains WAL/binlog meanwhile. The
+// exception is an event too large to ever be accepted, which is published
+// truncated instead of stalling the project's CDC for good.
 func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 	subject := buildSubject(p.cfg.SubjectPrefix, event.Schema, event.Table)
+	msgID := p.messageID(event)
 
-	data, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshaling event: %w", err)
+	err := p.send(ctx, subject, event, msgID)
+	if isTooLarge(err) {
+		err = p.sendTruncated(ctx, subject, event, msgID)
 	}
-
-	if err := p.publishWithRetry(ctx, subject, data, p.messageID(event), event.Type.String()); err != nil {
+	if err != nil {
 		return err
 	}
 
@@ -292,6 +294,40 @@ func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 		(*fn)(event)
 	}
 	return nil
+}
+
+func (p *Publisher) send(ctx context.Context, subject string, event cdc.Event, msgID string) error {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshaling event: %w", err)
+	}
+	return p.publishWithRetry(ctx, subject, data, msgID, event.Type.String())
+}
+
+// sendTruncated publishes the event with only its key columns, or with no data
+// when even the key is too large. It keeps the event's message id, so a
+// re-read of the same change is deduplicated like any other.
+func (p *Publisher) sendTruncated(ctx context.Context, subject string, event cdc.Event, msgID string) error {
+	metrics.IncOversizedEvent(event.Type.String())
+	slog.Warn("event too large for NATS, publishing its key only",
+		"type", event.Type.String(), "schema", event.Schema, "table", event.Table, "lsn", event.LSN)
+	err := p.send(ctx, subject, event.Truncated(), msgID)
+	if isTooLarge(err) {
+		err = p.send(ctx, subject, event.Stripped(), msgID)
+	}
+	return err
+}
+
+// streamMessageTooLarge is JetStream's "message size exceeds maximum allowed"
+// (the stream's max_msg_size); nats.ErrMaxPayload is the server's max_payload.
+const streamMessageTooLarge jetstream.ErrorCode = 10054
+
+func isTooLarge(err error) bool {
+	if errors.Is(err, nats.ErrMaxPayload) {
+		return true
+	}
+	var apiErr *jetstream.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode == streamMessageTooLarge
 }
 
 // messageID is scoped by subject prefix because every tenant publishes into
@@ -311,8 +347,8 @@ func (p *Publisher) publishWithRetry(ctx context.Context, subject string, data [
 	delay := p.retryBaseDelay
 	for {
 		err := p.publishFn(ctx, subject, data, msgID)
-		if err == nil {
-			return nil
+		if err == nil || isTooLarge(err) {
+			return err
 		}
 		metrics.IncNATSError()
 		if p.connectionLost() {

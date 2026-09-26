@@ -89,6 +89,11 @@ type Event struct {
 	// Sequence is the event's place in its listener's hand-off order, which
 	// is the order the publisher acks in; 0 when the listener does not gate.
 	Sequence uint64 `json:"-"`
+	// DataTruncated marks an event too large for the bus, published with only
+	// its key columns (or no data) so consumers can refetch the row.
+	DataTruncated bool `json:"dataTruncated,omitempty"`
+	// KeyColumns names the row's replica identity columns, when known.
+	KeyColumns []string `json:"-"`
 }
 
 func NewEvent(typ EventType, schema, table, data, rawMessage, lsn string) Event {
