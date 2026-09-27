@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -218,7 +219,7 @@ func (p *Parser) parseInsert(buf *reader, lsn string) *cdc.Event {
 	// DDL log table interception
 	if p.captureDDL && rel.Name == ddlLogTable {
 		buf.readByte() // skip tuple type
-		data := p.parseTupleData(buf, rel.Columns, rel.TypeOIDs)
+		data := p.parseTupleData(buf, rel, false)
 		e := cdc.NewEvent(cdc.DDL, rel.Namespace, "", data, "DDL", lsn)
 		return &e
 	}
@@ -228,7 +229,7 @@ func (p *Parser) parseInsert(buf *reader, lsn string) *cdc.Event {
 	}
 
 	buf.readByte() // skip tuple type
-	data := p.parseTupleData(buf, rel.Columns, rel.TypeOIDs)
+	data := p.parseTupleData(buf, rel, false)
 	e := cdc.NewEvent(cdc.Insert, rel.Namespace, rel.Name, data, "INSERT", lsn)
 	e.KeyColumns = rel.KeyColumns
 	return &e
@@ -251,7 +252,7 @@ func (p *Parser) parseUpdate(buf *reader, lsn string) *cdc.Event {
 	if buf.remaining() > 0 {
 		tupleType := buf.readByte()
 		if tupleType == 'K' || tupleType == 'O' {
-			oldData := p.parseTupleData(buf, rel.Columns, rel.TypeOIDs)
+			oldData := p.parseTupleData(buf, rel, tupleType == 'K')
 			sb.WriteString(`"old":`)
 			sb.WriteString(oldData)
 		} else {
@@ -262,7 +263,7 @@ func (p *Parser) parseUpdate(buf *reader, lsn string) *cdc.Event {
 	if buf.remaining() > 0 {
 		tupleType := buf.readByte()
 		if tupleType == 'N' {
-			newData := p.parseTupleData(buf, rel.Columns, rel.TypeOIDs)
+			newData := p.parseTupleData(buf, rel, false)
 			if sb.Len() > 1 {
 				sb.WriteString(", ")
 			}
@@ -289,8 +290,8 @@ func (p *Parser) parseDelete(buf *reader, lsn string) *cdc.Event {
 	}
 
 	if buf.remaining() > 0 {
-		buf.readByte() // skip tuple type
-		data := p.parseTupleData(buf, rel.Columns, rel.TypeOIDs)
+		tupleType := buf.readByte()
+		data := p.parseTupleData(buf, rel, tupleType == 'K')
 		e := cdc.NewEvent(cdc.Delete, rel.Namespace, rel.Name, data, "DELETE", lsn)
 		e.KeyColumns = rel.KeyColumns
 		return &e
@@ -330,7 +331,11 @@ func (p *Parser) parseTruncate(buf *reader, lsn string) *cdc.Event {
 	return first
 }
 
-func (p *Parser) parseTupleData(buf *reader, columns []string, typeOIDs []int) string {
+// parseTupleData renders one row image as JSON. A column whose value the
+// message does not carry is left out rather than given a value it does not
+// have: an unchanged TOAST value, and, in a key-only image, every column
+// outside the replica identity (Postgres sends those as NULL).
+func (p *Parser) parseTupleData(buf *reader, rel *RelationInfo, keyOnly bool) string {
 	if buf.remaining() < 2 {
 		return "{}"
 	}
@@ -339,21 +344,26 @@ func (p *Parser) parseTupleData(buf *reader, columns []string, typeOIDs []int) s
 	var sb strings.Builder
 	sb.WriteByte('{')
 
+	written := 0
 	for i := 0; i < numCols; i++ {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-
 		colType := buf.readByte()
 		colName := "col_" + strconv.Itoa(i)
-		if i < len(columns) {
-			colName = columns[i]
+		if i < len(rel.Columns) {
+			colName = rel.Columns[i]
+		}
+		if colType == 'u' || (keyOnly && !slices.Contains(rel.KeyColumns, colName)) {
+			skipTupleValue(buf, colType)
+			continue
 		}
 		typeOID := 0
-		if i < len(typeOIDs) {
-			typeOID = typeOIDs[i]
+		if i < len(rel.TypeOIDs) {
+			typeOID = rel.TypeOIDs[i]
 		}
 
+		if written > 0 {
+			sb.WriteString(", ")
+		}
+		written++
 		sb.WriteByte('"')
 		sb.WriteString(jsonutil.EscapeString(colName))
 		sb.WriteString(`":`)
@@ -365,14 +375,18 @@ func (p *Parser) parseTupleData(buf *reader, columns []string, typeOIDs []int) s
 	return sb.String()
 }
 
+func skipTupleValue(buf *reader, colType byte) {
+	if colType == 't' {
+		buf.readBytes(int(buf.readUint32()))
+	}
+}
+
 func writeTupleValue(sb *strings.Builder, buf *reader, colType byte, typeOID int) {
 	switch colType {
 	case 'n':
 		sb.WriteString("null")
 	case 't':
 		writeTextValue(sb, buf, typeOID)
-	case 'u':
-		sb.WriteString(`"unchanged"`)
 	default:
 		sb.WriteString(`"unknown"`)
 	}

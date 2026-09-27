@@ -21,14 +21,6 @@ func TestWriteTupleValueNull(t *testing.T) {
 	}
 }
 
-func TestWriteTupleValueUnchangedTOAST(t *testing.T) {
-	var sb strings.Builder
-	writeTupleValue(&sb, &reader{}, 'u', 0)
-	if sb.String() != `"unchanged"` {
-		t.Errorf("got %q", sb.String())
-	}
-}
-
 func TestWriteTupleValueUnknownMarker(t *testing.T) {
 	var sb strings.Builder
 	writeTupleValue(&sb, &reader{}, 'x', 0)

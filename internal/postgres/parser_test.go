@@ -120,9 +120,14 @@ func buildCommitMsg(commitMicros uint64) []byte {
 
 // Build a DELETE message: 'D' + relation_id(4) + tuple_type(1) + tuple_data
 func buildDeleteMsg(relID uint32, values []testTupleVal) []byte {
+	return buildDeleteMsgWithTuple(relID, 'K', values)
+}
+
+// tupleType is 'K' (replica identity key only) or 'O' (the full old row).
+func buildDeleteMsgWithTuple(relID uint32, tupleType byte, values []testTupleVal) []byte {
 	buf := []byte{'D'}
 	buf = appendUint32(buf, relID)
-	buf = append(buf, 'K') // key tuple
+	buf = append(buf, tupleType)
 	buf = appendTupleData(buf, values)
 	return buf
 }
@@ -288,7 +293,9 @@ func TestParseInsertWithUnchangedToast(t *testing.T) {
 	})
 	event := p.Parse(insMsg, "0/2")
 
-	expected := `{"id":1, "content":"unchanged"}`
+	// An unchanged TOAST value is not in the message: the column is left out
+	// rather than reported with a value it does not have.
+	expected := `{"id":1}`
 	if event.Data != expected {
 		t.Errorf("data = %q\nwant  %q", event.Data, expected)
 	}
@@ -352,13 +359,13 @@ func TestParseUpdateWithoutOldTuple(t *testing.T) {
 func TestParseDelete(t *testing.T) {
 	p := NewParser(nil, false, nil)
 
-	relMsg := buildRelationMsg(1, "public", "users", []testCol{
+	relMsg := buildKeyedRelationMsg(1, "public", "users", []testCol{
 		{"id", 23},
 		{"name", 25},
-	})
+	}, "id")
 	p.Parse(relMsg, "0/1")
 
-	delMsg := buildDeleteMsg(1, []testTupleVal{
+	delMsg := buildDeleteMsgWithTuple(1, 'O', []testTupleVal{
 		{'t', "1"},
 		{'t', "Alice"},
 	})
@@ -662,5 +669,77 @@ func TestRowEventsCarryTheReplicaIdentityColumns(t *testing.T) {
 	}
 	if !slices.Equal(event.KeyColumns, []string{"id", "tenant"}) {
 		t.Errorf("KeyColumns = %v, want [id tenant]", event.KeyColumns)
+	}
+}
+
+// With the default replica identity a DELETE carries only the key; Postgres
+// sends every other column as NULL. Reporting those NULLs would state values
+// the row never had, so the image holds the key columns alone.
+func TestParseDeleteKeyOnlyImageCarriesOnlyTheKey(t *testing.T) {
+	p := NewParser(nil, false, nil)
+	p.Parse(buildKeyedRelationMsg(1, "public", "notes", []testCol{
+		{name: "id", typeOID: 23}, {name: "owner_id", typeOID: 25}, {name: "archived_at", typeOID: 25},
+	}, "id"), "0/1")
+
+	event := p.Parse(buildDeleteMsg(1, []testTupleVal{
+		{marker: 't', value: "7"}, {marker: 'n'}, {marker: 'n'},
+	}), "0/2")
+
+	if event == nil {
+		t.Fatal("no event")
+	}
+	if want := `{"id":7}`; event.Data != want {
+		t.Errorf("data = %q, want %q", event.Data, want)
+	}
+}
+
+// A real NULL in a full old image is a value and stays.
+func TestParseDeleteFullImageKeepsNulls(t *testing.T) {
+	p := NewParser(nil, false, nil)
+	p.Parse(buildKeyedRelationMsg(1, "public", "notes", []testCol{
+		{name: "id", typeOID: 23}, {name: "owner_id", typeOID: 25},
+	}, "id"), "0/1")
+
+	event := p.Parse(buildDeleteMsgWithTuple(1, 'O', []testTupleVal{
+		{marker: 't', value: "7"}, {marker: 'n'},
+	}), "0/2")
+
+	if want := `{"id":7, "owner_id":null}`; event.Data != want {
+		t.Errorf("data = %q, want %q", event.Data, want)
+	}
+}
+
+func TestParseUpdateKeyOnlyOldImageCarriesOnlyTheKey(t *testing.T) {
+	p := NewParser(nil, false, nil)
+	p.Parse(buildKeyedRelationMsg(1, "public", "notes", []testCol{
+		{name: "id", typeOID: 23}, {name: "owner_id", typeOID: 25},
+	}, "id"), "0/1")
+
+	msg := []byte{'U'}
+	msg = appendUint32(msg, 1)
+	msg = append(msg, 'K')
+	msg = appendTupleData(msg, []testTupleVal{{marker: 't', value: "7"}, {marker: 'n'}})
+	msg = append(msg, 'N')
+	msg = appendTupleData(msg, []testTupleVal{{marker: 't', value: "8"}, {marker: 't', value: "u1"}})
+	event := p.Parse(msg, "0/2")
+
+	if want := `{"old":{"id":7}, "new":{"id":8, "owner_id":"u1"}}`; event.Data != want {
+		t.Errorf("data = %q, want %q", event.Data, want)
+	}
+}
+
+// An unchanged TOAST column in an UPDATE's new image is left out too.
+func TestParseUpdateOmitsUnchangedToast(t *testing.T) {
+	p := NewParser(nil, false, nil)
+	p.Parse(buildKeyedRelationMsg(1, "public", "docs", []testCol{
+		{name: "id", typeOID: 23}, {name: "body", typeOID: 25}, {name: "title", typeOID: 25},
+	}, "id"), "0/1")
+
+	event := p.Parse(buildUpdateMsg(1, nil, []testTupleVal{
+		{marker: 't', value: "1"}, {marker: 'u'}, {marker: 't', value: "t"},
+	}), "0/2")
+
+	if want := `{"new":{"id":1, "title":"t"}}`; event.Data != want {
+		t.Errorf("data = %q, want %q", event.Data, want)
 	}
 }
