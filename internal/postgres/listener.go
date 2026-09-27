@@ -45,6 +45,7 @@ type Listener struct {
 	txnIndex int
 	registry *slotRegistry
 	cleaner  *slotCleaner
+	sampler  *slotSampler
 
 	conn *pgconn.PgConn
 	// maintenance serves slot-stat sampling; separate from the replication
@@ -89,6 +90,7 @@ func NewListener(cfg config.PostgresConfig, service *cdc.Service) (*Listener, er
 		lag:         newLagTracker(time.Now),
 		ack:         newAckGate(),
 	}
+	listener.sampler = listener.newSlotSampler()
 	listener.parser.SetEventHandler(listener.emit)
 	return listener, nil
 }
@@ -298,14 +300,61 @@ func (l *Listener) slotStatsInterval() time.Duration {
 	return time.Duration(l.cfg.SlotStatsIntervalSeconds) * time.Second
 }
 
-func (l *Listener) sampleSlotStats(ctx context.Context) {
-	defer l.wg.Done()
-	sampler := newSlotSampler(l.slotStatsInterval(), l.lag, func(ctx context.Context) (SlotStats, error) {
+func (l *Listener) newSlotSampler() *slotSampler {
+	return newSlotSampler(l.slotStatsInterval(), l.lag, func(ctx context.Context) (SlotStats, error) {
 		ctx, cancel := context.WithTimeout(ctx, maintenanceQueryTimeout)
 		defer cancel()
 		return querySlotStats(ctx, l.maintenance, l.cfg.SlotName)
 	})
-	sampler.run(ctx)
+}
+
+func (l *Listener) sampleSlotStats(ctx context.Context) {
+	defer l.wg.Done()
+	l.sampler.run(ctx)
+}
+
+// startStreaming starts replication; when that fails because the slot is gone
+// or invalidated, the slot is recreated so the next attempt succeeds.
+func (l *Listener) startStreaming(ctx context.Context, conn *pgconn.PgConn) error {
+	err := l.startReplication(ctx, conn)
+	if err == nil {
+		return nil
+	}
+	return errors.Join(err, l.recreateUnusableSlot(ctx))
+}
+
+// recreateUnusableSlot replaces a dropped or invalidated slot with a new one
+// at the current WAL position, so streaming resumes from now. What happened in
+// between is lost; the counter and the error log make that gap visible.
+func (l *Listener) recreateUnusableSlot(ctx context.Context) error {
+	if !l.cfg.CreateSlot {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, maintenanceQueryTimeout)
+	defer cancel()
+	stats, lookupErr := querySlotStats(ctx, l.maintenance, l.cfg.SlotName)
+	needsRecreating, err := slotNeedsRecreating(stats, lookupErr)
+	if err != nil || !needsRecreating {
+		return err
+	}
+	if lookupErr == nil {
+		if err := dropReplicationSlot(ctx, l.maintenance, l.cfg.SlotName); err != nil {
+			return fmt.Errorf("dropping invalidated slot: %w", err)
+		}
+	}
+	if err := createReplicationSlotIfNotExists(ctx, l.maintenance, l.cfg.SlotName); err != nil {
+		return err
+	}
+	metrics.IncSlotRecreated()
+	slog.Error("replication slot recreated at the current WAL position; changes since its last confirmed position are lost",
+		"slot", l.cfg.SlotName)
+	return nil
+}
+
+// SlotUsable is false once the replication slot was found dropped or
+// invalidated: the watcher cannot stream again without losing changes.
+func (l *Listener) SlotUsable() bool {
+	return l.sampler.SlotUsable()
 }
 
 func (l *Listener) IsRunning() bool {
@@ -346,7 +395,7 @@ func (l *Listener) connectAndStream(ctx context.Context) error {
 		l.conn = nil
 	}()
 
-	if err := l.startReplication(ctx, conn); err != nil {
+	if err := l.startStreaming(ctx, conn); err != nil {
 		return err
 	}
 

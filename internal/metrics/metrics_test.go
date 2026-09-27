@@ -71,3 +71,17 @@ func TestIncSlotDropped(t *testing.T) {
 		t.Errorf("cdc_slots_dropped_total = %f, want %f", got, before+1)
 	}
 }
+
+func TestSetSlotWALStatusIsOneHot(t *testing.T) {
+	SetSlotWALStatus("extended", 123)
+	SetSlotWALStatus("lost", -1)
+
+	for status, want := range map[string]float64{"reserved": 0, "extended": 0, "unreserved": 0, "lost": 1} {
+		if got := testutil.ToFloat64(SlotWALStatus.WithLabelValues(status)); got != want {
+			t.Errorf("cdc_slot_wal_status{status=%q} = %v, want %v", status, got, want)
+		}
+	}
+	if got := testutil.ToFloat64(SlotSafeWALBytes); got != -1 {
+		t.Errorf("cdc_slot_safe_wal_bytes = %v, want -1", got)
+	}
+}

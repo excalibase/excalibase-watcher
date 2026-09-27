@@ -70,6 +70,28 @@ var (
 		},
 	)
 
+	SlotWALStatus = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "cdc_slot_wal_status",
+			Help: "1 for the replication slot's current wal_status (reserved, extended, unreserved, lost), 0 for the others",
+		},
+		[]string{"status"},
+	)
+
+	SlotSafeWALBytes = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "cdc_slot_safe_wal_bytes",
+			Help: "WAL that may still be written before the slot is invalidated; -1 when max_slot_wal_keep_size is unlimited",
+		},
+	)
+
+	SlotsRecreated = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "cdc_slots_recreated_total",
+			Help: "Times the watcher recreated its dropped or invalidated slot at the current position; each one is a gap in the changes",
+		},
+	)
+
 	SlotsDropped = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "cdc_slots_dropped_total",
@@ -101,6 +123,10 @@ func IncNATSError() {
 	NATSErrors.Inc()
 }
 
+func IncSlotRecreated() {
+	SlotsRecreated.Inc()
+}
+
 func IncSlotDropped() {
 	SlotsDropped.Inc()
 }
@@ -115,6 +141,19 @@ func SetSlotStats(confirmedFlushLSN, restartLSN, retainedWALBytes uint64) {
 	SlotConfirmedFlushLSN.Set(float64(confirmedFlushLSN))
 	SlotRestartLSN.Set(float64(restartLSN))
 	SlotRetainedWALBytes.Set(float64(retainedWALBytes))
+}
+
+var slotWALStatuses = []string{"reserved", "extended", "unreserved", "lost"}
+
+func SetSlotWALStatus(status string, safeWALBytes int64) {
+	for _, candidate := range slotWALStatuses {
+		value := 0.0
+		if candidate == status {
+			value = 1
+		}
+		SlotWALStatus.WithLabelValues(candidate).Set(value)
+	}
+	SlotSafeWALBytes.Set(float64(safeWALBytes))
 }
 
 func SetLastEventTimestamp(at time.Time) {
