@@ -130,7 +130,9 @@ func (l *Listener) Start(ctx context.Context) error {
 	ctx, l.cancel = context.WithCancel(ctx)
 
 	// Setup: publication, slot, DDL triggers (use standard connection, not replication)
-	setupConn, err := connectStandard(ctx, l.cfg)
+	setupConn, err := waitForDatabase(ctx, func(ctx context.Context) (*pgx.Conn, error) {
+		return connectStandard(ctx, l.cfg)
+	}, startupBackoff{next: firstStartupDelay, max: maxReconnectDelay})
 	if err != nil {
 		return fmt.Errorf("setup connection: %w", err)
 	}

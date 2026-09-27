@@ -121,3 +121,36 @@ func TestWithReadinessLeavesTheOriginalCheckerUnchanged(t *testing.T) {
 		t.Errorf("base checker status = %d, want 200", code)
 	}
 }
+
+func TestStartingIsAliveButNotReady(t *testing.T) {
+	checker := NewChecker(func() bool { return false }, func() int { return 0 }).
+		WithStartup(func() bool { return true })
+
+	w := httptest.NewRecorder()
+	checker.HealthHandler(w, httptest.NewRequest("GET", "/healthz", nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("healthz while starting = %d, want 200 so the pod is not restarted", w.Code)
+	}
+	var status Status
+	json.Unmarshal(w.Body.Bytes(), &status)
+	if status.Status != "STARTING" {
+		t.Errorf("status = %q, want STARTING", status.Status)
+	}
+
+	w = httptest.NewRecorder()
+	checker.ReadyHandler(w, httptest.NewRequest("GET", "/readyz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("readyz while starting = %d, want 503", w.Code)
+	}
+}
+
+func TestDownOnceStartupHasEndedWithoutRunning(t *testing.T) {
+	checker := NewChecker(func() bool { return false }, func() int { return 0 }).
+		WithStartup(func() bool { return false })
+
+	w := httptest.NewRecorder()
+	checker.HealthHandler(w, httptest.NewRequest("GET", "/healthz", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("healthz = %d, want 503", w.Code)
+	}
+}
