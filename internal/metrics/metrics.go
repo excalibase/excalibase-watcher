@@ -24,6 +24,14 @@ var (
 		[]string{"type"},
 	)
 
+	OversizedEvents = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "cdc_oversized_events_total",
+			Help: "Events too large for NATS, published with only their key columns, by type",
+		},
+		[]string{"type"},
+	)
+
 	NATSErrors = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "cdc_nats_errors_total",
@@ -83,6 +91,10 @@ func IncEvent(eventType string) {
 
 func IncNATSPublished(eventType string) {
 	NATSPublished.WithLabelValues(eventType).Inc()
+}
+
+func IncOversizedEvent(eventType string) {
+	OversizedEvents.WithLabelValues(eventType).Inc()
 }
 
 func IncNATSError() {

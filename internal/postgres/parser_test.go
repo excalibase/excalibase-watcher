@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"encoding/binary"
+	"slices"
 	"testing"
 
 	"github.com/excalibase/watcher-go/internal/cdc"
@@ -40,6 +41,11 @@ func appendInt32(buf []byte, v int32) []byte {
 
 // Build a RELATION message: 'R' + relation_id(4) + namespace(cstring) + name(cstring) + replica_identity(1) + num_columns(2) + columns...
 func buildRelationMsg(relID uint32, namespace, name string, cols []testCol) []byte {
+	return buildKeyedRelationMsg(relID, namespace, name, cols)
+}
+
+// buildKeyedRelationMsg flags the key columns as part of the replica identity.
+func buildKeyedRelationMsg(relID uint32, namespace, name string, cols []testCol, key ...string) []byte {
 	buf := []byte{'R'}
 	buf = appendUint32(buf, relID)
 	buf = appendCString(buf, namespace)
@@ -47,12 +53,19 @@ func buildRelationMsg(relID uint32, namespace, name string, cols []testCol) []by
 	buf = append(buf, 0) // replica identity
 	buf = appendUint16(buf, uint16(len(cols)))
 	for _, c := range cols {
-		buf = append(buf, 0) // column flags
+		buf = append(buf, columnFlags(c.name, key))
 		buf = appendCString(buf, c.name)
 		buf = appendUint32(buf, uint32(c.typeOID))
 		buf = appendInt32(buf, 0) // type modifier
 	}
 	return buf
+}
+
+func columnFlags(column string, key []string) byte {
+	if slices.Contains(key, column) {
+		return 1
+	}
+	return 0
 }
 
 type testCol struct {
@@ -631,5 +644,23 @@ func TestSlotOwnerRegistryTableIsNeverEmitted(t *testing.T) {
 	}
 	if event := p.Parse(buildUpdateMsg(9, nil, []testTupleVal{{'t', "cdc_slot"}}), "0/3"); event != nil {
 		t.Errorf("UPDATE on %s emitted %v", slotOwnersTable, event.Type)
+	}
+}
+
+func TestRowEventsCarryTheReplicaIdentityColumns(t *testing.T) {
+	p := NewParser(nil, false, nil)
+	p.Parse(buildKeyedRelationMsg(1, "public", "docs", []testCol{
+		{name: "id", typeOID: 23}, {name: "tenant", typeOID: 25}, {name: "body", typeOID: 25},
+	}, "id", "tenant"), "0/0")
+
+	event := p.Parse(buildInsertMsg(1, []testTupleVal{
+		{marker: 't', value: "7"}, {marker: 't', value: "a"}, {marker: 't', value: "x"},
+	}), "0/1")
+
+	if event == nil {
+		t.Fatal("no event")
+	}
+	if !slices.Equal(event.KeyColumns, []string{"id", "tenant"}) {
+		t.Errorf("KeyColumns = %v, want [id tenant]", event.KeyColumns)
 	}
 }

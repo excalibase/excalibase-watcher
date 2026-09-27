@@ -51,6 +51,8 @@ type RelationInfo struct {
 	Name      string
 	Columns   []string
 	TypeOIDs  []int
+	// KeyColumns are the replica identity columns (column flag bit 1).
+	KeyColumns []string
 }
 
 type Parser struct {
@@ -161,19 +163,25 @@ func (p *Parser) parseRelation(buf *reader) *cdc.Event {
 	numCols := buf.readUint16()
 	columns := make([]string, 0, numCols)
 	typeOIDs := make([]int, 0, numCols)
+	var keyColumns []string
 
 	for i := 0; i < int(numCols); i++ {
-		buf.readByte() // column flags
-		columns = append(columns, buf.readCString())
+		flags := buf.readByte()
+		column := buf.readCString()
+		columns = append(columns, column)
+		if flags&1 == 1 {
+			keyColumns = append(keyColumns, column)
+		}
 		typeOIDs = append(typeOIDs, int(buf.readUint32()))
 		buf.readUint32() // type modifier
 	}
 
 	p.relationMap[relID] = &RelationInfo{
-		Namespace: namespace,
-		Name:      name,
-		Columns:   columns,
-		TypeOIDs:  typeOIDs,
+		Namespace:  namespace,
+		Name:       name,
+		Columns:    columns,
+		TypeOIDs:   typeOIDs,
+		KeyColumns: keyColumns,
 	}
 
 	if p.schemaStore != nil {
@@ -222,6 +230,7 @@ func (p *Parser) parseInsert(buf *reader, lsn string) *cdc.Event {
 	buf.readByte() // skip tuple type
 	data := p.parseTupleData(buf, rel.Columns, rel.TypeOIDs)
 	e := cdc.NewEvent(cdc.Insert, rel.Namespace, rel.Name, data, "INSERT", lsn)
+	e.KeyColumns = rel.KeyColumns
 	return &e
 }
 
@@ -264,6 +273,7 @@ func (p *Parser) parseUpdate(buf *reader, lsn string) *cdc.Event {
 
 	sb.WriteByte('}')
 	e := cdc.NewEvent(cdc.Update, rel.Namespace, rel.Name, sb.String(), "UPDATE", lsn)
+	e.KeyColumns = rel.KeyColumns
 	return &e
 }
 
@@ -282,6 +292,7 @@ func (p *Parser) parseDelete(buf *reader, lsn string) *cdc.Event {
 		buf.readByte() // skip tuple type
 		data := p.parseTupleData(buf, rel.Columns, rel.TypeOIDs)
 		e := cdc.NewEvent(cdc.Delete, rel.Namespace, rel.Name, data, "DELETE", lsn)
+		e.KeyColumns = rel.KeyColumns
 		return &e
 	}
 

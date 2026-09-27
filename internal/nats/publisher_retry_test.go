@@ -2,7 +2,9 @@ package nats
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -10,6 +12,10 @@ import (
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/config"
+	"github.com/excalibase/watcher-go/internal/metrics"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 type publishFunc = func(ctx context.Context, subject string, data []byte, msgID string) error
@@ -132,5 +138,104 @@ func TestEventWithoutASourcePositionGetsAUniqueID(t *testing.T) {
 	first, second := p.messageID(event), p.messageID(event)
 	if first == "" || first == second {
 		t.Errorf("snapshot ids %q and %q must be non-empty and distinct", first, second)
+	}
+}
+
+type sentMessage struct {
+	data  []byte
+	msgID string
+}
+
+// sizeLimitedPublisher accepts payloads up to limit and fails bigger ones with tooLarge.
+func sizeLimitedPublisher(limit int, tooLarge error) (*Publisher, *[]sentMessage, *atomic.Int32) {
+	var sent []sentMessage
+	var attempts atomic.Int32
+	p := newTestPublisher(func(_ context.Context, _ string, data []byte, msgID string) error {
+		attempts.Add(1)
+		if len(data) > limit {
+			return tooLarge
+		}
+		sent = append(sent, sentMessage{data: data, msgID: msgID})
+		return nil
+	})
+	return p, &sent, &attempts
+}
+
+func oversizedEvent() cdc.Event {
+	event := cdc.NewEvent(cdc.Insert, "public", "docs", `{"id":7,"body":"`+strings.Repeat("x", 2000)+`"}`, "INSERT", "0/10")
+	event.KeyColumns = []string{"id"}
+	event.SourceID = "pg:0/10:0"
+	return event
+}
+
+func decodeSent(t *testing.T, message sentMessage) map[string]any {
+	t.Helper()
+	var fields map[string]any
+	if err := json.Unmarshal(message.data, &fields); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return fields
+}
+
+func TestOversizedEventIsPublishedTruncatedWithoutRetrying(t *testing.T) {
+	for name, tooLarge := range map[string]error{
+		"server max payload": nats.ErrMaxPayload,
+		"stream max size":    &jetstream.APIError{ErrorCode: streamMessageTooLarge, Description: "message size exceeds maximum allowed"},
+	} {
+		t.Run(name, func(t *testing.T) { checkOversizedPublish(t, tooLarge) })
+	}
+}
+
+func checkOversizedPublish(t *testing.T, tooLarge error) {
+	p, sent, attempts := sizeLimitedPublisher(400, tooLarge)
+	var acked []cdc.Event
+	p.SetOnPublished(func(e cdc.Event) { acked = append(acked, e) })
+	before := testutil.ToFloat64(metrics.OversizedEvents.WithLabelValues("INSERT"))
+
+	if err := p.publish(context.Background(), oversizedEvent()); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if attempts.Load() != 2 {
+		t.Errorf("attempts = %d, want 2 (the full event once, then the truncated one)", attempts.Load())
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(*sent))
+	}
+	assertKeyOnly(t, (*sent)[0])
+	if len(acked) != 1 || acked[0].LSN != "0/10" {
+		t.Errorf("acked %v, want the event's position acknowledged once", acked)
+	}
+	if got := testutil.ToFloat64(metrics.OversizedEvents.WithLabelValues("INSERT")) - before; got != 1 {
+		t.Errorf("oversized counter moved by %v, want 1", got)
+	}
+}
+
+func assertKeyOnly(t *testing.T, message sentMessage) {
+	t.Helper()
+	fields := decodeSent(t, message)
+	if fields["dataTruncated"] != true || fields["data"] != `{"id":7}` {
+		t.Errorf("published %v, want the key only, marked truncated", fields)
+	}
+	if message.msgID != "cdc/pg:0/10:0" {
+		t.Errorf("msg id = %q, want the event's own id so a replay is deduplicated", message.msgID)
+	}
+}
+
+func TestOversizedKeyIsPublishedWithoutData(t *testing.T) {
+	p, sent, _ := sizeLimitedPublisher(300, nats.ErrMaxPayload)
+	event := oversizedEvent()
+	event.Data = `{"id":"` + strings.Repeat("k", 1000) + `"}`
+
+	if err := p.publish(context.Background(), event); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	if len(*sent) != 1 {
+		t.Fatalf("sent %d messages, want 1", len(*sent))
+	}
+	fields := decodeSent(t, (*sent)[0])
+	if _, hasData := fields["data"]; hasData || fields["dataTruncated"] != true {
+		t.Errorf("published %v, want no data, marked truncated", fields)
 	}
 }
