@@ -1,6 +1,7 @@
 package nats
 
 import (
+	"context"
 	"testing"
 
 	"github.com/excalibase/watcher-go/internal/cdc"
@@ -75,17 +76,19 @@ func TestNewPublisherInitialState(t *testing.T) {
 	}
 }
 
-func TestSetOnPublished(t *testing.T) {
-	svc := cdc.NewService()
-	p := NewPublisher(config.NATSConfig{}, svc)
-	var called bool
-	p.SetOnPublished(func(cdc.Event) { called = true })
-	fn := p.onPublished.Load()
-	if fn == nil {
-		t.Fatal("onPublished not set")
+// The Postgres and MySQL listeners both gate their offsets on acks, so a
+// publisher serving both must notify each of them.
+func TestEveryPublishedObserverIsNotified(t *testing.T) {
+	p := newTestPublisher(func(context.Context, string, []byte, string) error { return nil })
+	var first, second int
+	p.AddOnPublished(func(cdc.Event) { first++ })
+	p.AddOnPublished(func(cdc.Event) { second++ })
+
+	event := cdc.NewEvent(cdc.Insert, "public", "users", `{"id":1}`, "INSERT", "0/10")
+	if err := p.publish(context.Background(), event); err != nil {
+		t.Fatalf("publish: %v", err)
 	}
-	(*fn)(cdc.Event{})
-	if !called {
-		t.Error("callback not invoked")
+	if first != 1 || second != 1 {
+		t.Errorf("observer calls = %d and %d, want 1 each", first, second)
 	}
 }

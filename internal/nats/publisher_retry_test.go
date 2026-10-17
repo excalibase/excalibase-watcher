@@ -36,7 +36,7 @@ func TestPublishRetriesUntilSuccessAndAcksOnlyOnce(t *testing.T) {
 		return nil
 	})
 	var acked atomic.Int32
-	p.SetOnPublished(func(cdc.Event) { acked.Add(1) })
+	p.AddOnPublished(func(cdc.Event) { acked.Add(1) })
 
 	event := cdc.NewEvent(cdc.Insert, "public", "users", `{"id":1}`, "INSERT", "0/10")
 	if err := p.publish(context.Background(), event); err != nil {
@@ -94,7 +94,7 @@ func TestPublishDoesNotAckWhileFailing(t *testing.T) {
 		return errors.New("nats: no responders")
 	})
 	var acked atomic.Int32
-	p.SetOnPublished(func(cdc.Event) { acked.Add(1) })
+	p.AddOnPublished(func(cdc.Event) { acked.Add(1) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -189,7 +189,7 @@ func TestOversizedEventIsPublishedTruncatedWithoutRetrying(t *testing.T) {
 func checkOversizedPublish(t *testing.T, tooLarge error) {
 	p, sent, attempts := sizeLimitedPublisher(400, tooLarge)
 	var acked []cdc.Event
-	p.SetOnPublished(func(e cdc.Event) { acked = append(acked, e) })
+	p.AddOnPublished(func(e cdc.Event) { acked = append(acked, e) })
 	before := testutil.ToFloat64(metrics.OversizedEvents.WithLabelValues("INSERT"))
 
 	if err := p.publish(context.Background(), oversizedEvent()); err != nil {

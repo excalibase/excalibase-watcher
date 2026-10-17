@@ -37,7 +37,7 @@ func startWatcherProcess(t *testing.T, pgCfg config.PostgresConfig, natsCfg conf
 	if err != nil {
 		t.Fatalf("NewListener: %v", err)
 	}
-	pub.SetOnPublished(listener.PublishedObserver())
+	pub.AddOnPublished(listener.PublishedObserver())
 	if err := pub.Start(context.Background()); err != nil {
 		t.Fatalf("publisher Start: %v", err)
 	}

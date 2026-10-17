@@ -39,20 +39,6 @@ func TestNewListenerWithOffsetFile(t *testing.T) {
 	}
 }
 
-func TestSetAckedLSNProvider(t *testing.T) {
-	svc := cdc.NewService()
-	l, _ := NewListener(config.MySQLConfig{}, svc)
-	called := false
-	l.SetAckedLSNProvider(func() string { called = true; return "foo" })
-	if l.ackedLSNProvider == nil {
-		t.Fatal("ackedLSNProvider not set")
-	}
-	_ = l.ackedLSNProvider()
-	if !called {
-		t.Error("provider not invoked")
-	}
-}
-
 func TestGetStartPositionNoStore(t *testing.T) {
 	svc := cdc.NewService()
 	l, _ := NewListener(config.MySQLConfig{}, svc)
@@ -120,7 +106,7 @@ func TestRowsGetPositionPlusRowIndexSourceIDs(t *testing.T) {
 	defer svc.Shutdown()
 	ch, unsub := svc.SubscribeAll()
 	defer unsub()
-	h := &eventHandler{service: svc, currentFile: "mysql-bin.000003"}
+	h := &eventHandler{service: svc, gate: newCommitGate(), currentFile: "mysql-bin.000003"}
 
 	rows := &canal.RowsEvent{
 		Table:  &schema.Table{Schema: "shop", Name: "orders", Columns: []schema.TableColumn{{Name: "id"}}},
@@ -145,7 +131,7 @@ func TestDDLGetsAPositionSourceID(t *testing.T) {
 	defer svc.Shutdown()
 	ch, unsub := svc.SubscribeAll()
 	defer unsub()
-	h := &eventHandler{service: svc}
+	h := &eventHandler{service: svc, gate: newCommitGate()}
 
 	err := h.OnDDL(nil, gomysql.Position{Name: "mysql-bin.000003", Pos: 900},
 		&replication.QueryEvent{Schema: []byte("shop"), Query: []byte("ALTER TABLE orders ADD c INT")})

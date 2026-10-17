@@ -68,7 +68,7 @@ func TestOversizedRowIsPublishedTruncatedAndCDCContinues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewListener: %v", err)
 	}
-	pub.SetOnPublished(listener.PublishedObserver())
+	pub.AddOnPublished(listener.PublishedObserver())
 	if err := pub.Start(ctx); err != nil {
 		t.Fatalf("publisher Start: %v", err)
 	}
