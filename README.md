@@ -98,6 +98,8 @@ YAML file (default `config.yaml`) with environment variable override via `WATCHE
 
 See `config.example.yaml` for the full schema.
 
+**MySQL is always reached over verified TLS.** `mysql.ca_cert` (env `WATCHER_MYSQL_CA_CERT`) is the PEM of the CA that signed the server certificate; the certificate must name the host in `mysql.host`. Without it the watcher does not start, and it never falls back to plaintext or an unverified connection.
+
 **Secrets must be provided via env vars.** The config file allows empty string for `username`/`password`; Viper `BindEnv` overrides them from env.
 
 ## Deployment

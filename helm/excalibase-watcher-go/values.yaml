@@ -105,6 +105,10 @@ mysql:
   existingSecret: ""
   existingSecretUsernameKey: "mysql-username"
   existingSecretPasswordKey: "mysql-password"
+  # PEM of the CA the server certificate is signed by. The watcher connects
+  # only over TLS verified against it and the host name above.
+  caCert: ""
+  existingSecretCACertKey: "mysql-ca-cert"
 
   # Database schema
   schema: ""

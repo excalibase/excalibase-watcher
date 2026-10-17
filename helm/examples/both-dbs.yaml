@@ -16,6 +16,7 @@ mysql:
   existingSecret: "mysql-credentials"
   existingSecretUsernameKey: "username"
   existingSecretPasswordKey: "password"
+  existingSecretCACertKey: "ca.crt"
   schema: "mydb"
   tables:
     - orders

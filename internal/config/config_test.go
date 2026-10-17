@@ -377,3 +377,20 @@ func TestSlotCleanupDryRunFromEnv(t *testing.T) {
 		t.Errorf("owner_id from env = %q, want pod-7", cfg.Postgres.OwnerID)
 	}
 }
+
+// EXC-589: the CA that verifies the MySQL server comes from the environment
+// like the credentials beside it.
+func TestMySQLServerCAFromTheEnvironment(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("mysql:\n  enabled: true\n  host: db:3306\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WATCHER_MYSQL_CA_CERT", "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n")
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.MySQL.CACert != os.Getenv("WATCHER_MYSQL_CA_CERT") {
+		t.Errorf("mysql.ca_cert = %q", cfg.MySQL.CACert)
+	}
+}
