@@ -78,17 +78,17 @@ func run() error {
 		defer listener.Stop()
 	}
 
-	stopMySQL, err := startMySQL(ctx, cfg, service, pub)
+	mysqlListener, err := startMySQL(ctx, cfg, service, pub)
 	if err != nil {
 		return err
 	}
-	if stopMySQL != nil {
-		defer stopMySQL()
+	if mysqlListener != nil {
+		defer mysqlListener.Stop()
 	}
 
 	starting.Store(false)
 	slog.Info("excalibase-watcher started")
-	runErr := waitForShutdown(ctx, publisherFailures(pub))
+	runErr := waitForShutdown(ctx, publisherFailures(pub), mysqlFailures(mysqlListener))
 
 	slog.Info("shutting down...")
 	stop()
@@ -134,7 +134,7 @@ func startPostgres(ctx context.Context, cfg *config.Config, service *cdc.Service
 	return pgListener, nil
 }
 
-func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher) (func(), error) {
+func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher) (*mysqllistener.Listener, error) {
 	if !cfg.MySQL.Enabled {
 		return nil, nil
 	}
@@ -152,7 +152,7 @@ func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, p
 	}
 	service.MarkRunning()
 	slog.Info("MySQL CDC listener started")
-	return mysqlListener.Stop, nil
+	return mysqlListener, nil
 }
 
 func startHTTPServer(cfg *config.Config, service *cdc.Service, pub *natsPublisher.Publisher,
@@ -197,12 +197,21 @@ func publisherFailures(pub *natsPublisher.Publisher) <-chan error {
 	return pub.Failed()
 }
 
-func waitForShutdown(ctx context.Context, failures <-chan error) error {
+func mysqlFailures(listener *mysqllistener.Listener) <-chan error {
+	if listener == nil {
+		return nil
+	}
+	return listener.Failed()
+}
+
+func waitForShutdown(ctx context.Context, natsFailures, mysqlFailures <-chan error) error {
 	select {
 	case <-ctx.Done():
 		return nil
-	case err := <-failures:
+	case err := <-natsFailures:
 		return fmt.Errorf("NATS publisher: %w", err)
+	case err := <-mysqlFailures:
+		return fmt.Errorf("MySQL listener: %w", err)
 	}
 }
 

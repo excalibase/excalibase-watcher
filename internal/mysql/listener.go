@@ -33,6 +33,13 @@ type Listener struct {
 	wg          sync.WaitGroup
 	gate        *commitGate
 	savedOffset BinlogPosition
+	failed      chan error
+}
+
+// Failed delivers the error that stopped binlog streaming while the listener
+// was meant to be running; the watcher exits on it instead of idling.
+func (l *Listener) Failed() <-chan error {
+	return l.failed
 }
 
 // PublishedObserver enables ack gating and returns the callback the NATS
@@ -54,6 +61,7 @@ func NewListener(cfg config.MySQLConfig, service *cdc.Service) (*Listener, error
 		service:     service,
 		offsetStore: store,
 		gate:        newCommitGate(),
+		failed:      make(chan error, 1),
 	}, nil
 }
 
@@ -99,6 +107,7 @@ func (l *Listener) Start(ctx context.Context) error {
 		runErr := c.RunFrom(mysql.Position{Name: startPos.File, Pos: startPos.Position})
 		if runErr != nil && l.running.Load() {
 			slog.Error("canal stopped with error", "error", runErr)
+			l.failed <- runErr
 		}
 	}()
 
@@ -246,6 +255,11 @@ type eventHandler struct {
 	// currentFile is updated by OnRotate; OnRow combines it with Header.LogPos.
 	lastPosMu   sync.Mutex
 	currentFile string
+
+	// txn is the open transaction (end of its GTID event) and txnRows the
+	// rows seen in it so far; only canal's goroutine touches them.
+	txn     BinlogPosition
+	txnRows int
 }
 
 // emit passes an event to the bus and counts it toward the commit gate when
@@ -267,24 +281,25 @@ func (h *eventHandler) currentBinlogFile() string {
 	return h.currentFile
 }
 
+// errUnplacedRow means a row arrived with no binlog position and no enclosing
+// transaction, so no message id would be both unique and stable on replay.
+var errUnplacedRow = errors.New("mysql row event has no binlog position and no enclosing transaction; " +
+	"refusing to publish it under an id that could collide")
+
 func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
-	schemaName := e.Table.Schema
-	table := e.Table.Name
-	// Stamp each event with its binlog position so the NATS publisher can
-	// drive offset persistence based on confirmed delivery, not canal's
-	// current position.
-	lsn := ""
-	if file := h.currentBinlogFile(); file != "" && e.Header != nil {
-		lsn = fmt.Sprintf("%s:%d", file, e.Header.LogPos)
+	rowID, lsn, err := h.rowIDs(e)
+	if err != nil {
+		return err
 	}
-	// All rows of one rows event share its position; the row index tells them apart.
 	publish := func(event cdc.Event, row int) {
-		if lsn != "" {
-			event.SourceID = fmt.Sprintf("%s%s:%d", sourcePrefix, lsn, row)
+		if rowID != nil {
+			event.SourceID = rowID(row)
 		}
 		h.emit(event)
 	}
 
+	schemaName := e.Table.Schema
+	table := e.Table.Name
 	switch e.Action {
 	case canal.InsertAction:
 		for i, row := range e.Rows {
@@ -303,6 +318,54 @@ func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
 			data := rowToJSON(e.Table, row)
 			publish(cdc.NewEvent(cdc.Delete, schemaName, table, data, "DELETE", lsn), i)
 		}
+	}
+	return nil
+}
+
+// rowIDs returns how to build each row's source id, and the event's position.
+//
+// A rows event's own position is shared by all its rows, so the row index
+// tells them apart. Events inside a compressed transaction payload carry
+// position 0, so their rows are placed by the enclosing transaction (the end
+// of its GTID event) and their order within it. Both are the same on replay.
+func (h *eventHandler) rowIDs(e *canal.RowsEvent) (func(row int) string, string, error) {
+	file := h.currentBinlogFile()
+	if file == "" || e.Header == nil {
+		return nil, "", nil
+	}
+	if e.Header.LogPos != 0 {
+		lsn := fmt.Sprintf("%s:%d", file, e.Header.LogPos)
+		return func(row int) string { return fmt.Sprintf("%s%s:%d", sourcePrefix, lsn, row) }, lsn, nil
+	}
+	if h.txn.File == "" {
+		return nil, "", errUnplacedRow
+	}
+	lsn := h.txn.String()
+	first := h.txnRows
+	h.txnRows += rowCount(e)
+	return func(row int) string { return fmt.Sprintf("%s%s:txn:%d", sourcePrefix, lsn, first+row) }, lsn, nil
+}
+
+func rowCount(e *canal.RowsEvent) int {
+	if e.Action == canal.UpdateAction {
+		return len(e.Rows) / 2
+	}
+	return len(e.Rows)
+}
+
+// OnGTID opens a transaction (anonymous GTIDs included). Where its GTID event
+// starts is a transaction boundary: the only one a compressed transaction
+// offers, since the XID inside its payload carries position 0.
+func (h *eventHandler) OnGTID(header *replication.EventHeader, _ mysql.BinlogGTIDEvent) error {
+	h.txn = BinlogPosition{}
+	h.txnRows = 0
+	file := h.currentBinlogFile()
+	if header == nil || file == "" || header.LogPos == 0 {
+		return nil
+	}
+	h.txn = BinlogPosition{File: file, Position: header.LogPos}
+	if header.LogPos >= header.EventSize {
+		h.gate.Committed(BinlogPosition{File: file, Position: header.LogPos - header.EventSize})
 	}
 	return nil
 }

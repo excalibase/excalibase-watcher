@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -18,6 +19,13 @@ import (
 
 func setupMySQL(t *testing.T) (string, int, func()) {
 	t.Helper()
+	return setupMySQLWithFlags(t)
+}
+
+// setupMySQLWithFlags starts MySQL with extra server flags on top of the
+// row-based binlog ones every test needs.
+func setupMySQLWithFlags(t *testing.T, flags ...string) (string, int, func()) {
+	t.Helper()
 	ctx := context.Background()
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
@@ -28,12 +36,12 @@ func setupMySQL(t *testing.T) (string, int, func()) {
 				"MYSQL_ROOT_PASSWORD": "testpass",
 				"MYSQL_DATABASE":      "testdb",
 			},
-			Cmd: []string{
+			Cmd: append([]string{
 				"--log-bin=mysql-bin",
 				"--binlog-format=ROW",
 				"--binlog-row-image=FULL",
 				"--server-id=1",
-			},
+			}, flags...),
 			WaitingFor: wait.ForLog("ready for connections").
 				WithOccurrence(2).
 				WithStartupTimeout(180 * time.Second),
@@ -318,5 +326,38 @@ func TestMySQLDDLCapture(t *testing.T) {
 	event := drainUntilType(t, ch, cdc.DDL, 15*time.Second)
 	if event.Type != cdc.DDL {
 		t.Errorf("type = %v, want DDL", event.Type)
+	}
+}
+
+// A binlog stream that stops while the listener should be running must
+// surface, so the watcher exits instead of idling with CDC stalled.
+func TestStreamingErrorIsReportedAsAFailure(t *testing.T) {
+	addr, _, cleanup := setupMySQL(t)
+	defer cleanup()
+
+	offsetFile := filepath.Join(t.TempDir(), "binlog.offset")
+	if err := NewFileOffsetStore(offsetFile).Save(BinlogPosition{File: "mysql-bin.999999", Position: 4}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := makeMySQLConfig(addr)
+	cfg.OffsetFile = offsetFile
+	svc := cdc.NewService()
+	defer svc.Shutdown()
+	listener, err := NewListener(cfg, svc)
+	if err != nil {
+		t.Fatalf("NewListener: %v", err)
+	}
+	if err := listener.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer listener.Stop()
+
+	select {
+	case err := <-listener.Failed():
+		if err == nil {
+			t.Fatal("failure delivered without an error")
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("streaming from a missing binlog file was never reported")
 	}
 }
