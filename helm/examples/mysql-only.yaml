@@ -11,6 +11,12 @@ mysql:
   # existingSecret: "my-mysql-secret"
   username: "root"
   password: "changeme"
+  # PEM of the CA that signed the server certificate; the watcher only
+  # connects over TLS verified against it.
+  caCert: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
   schema: "mydb"
   tables:
     - orders

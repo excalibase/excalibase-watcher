@@ -4,3 +4,4 @@ dist/
 *.test
 *.out
 .env
+e2e/tls/

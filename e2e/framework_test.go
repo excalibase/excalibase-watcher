@@ -18,7 +18,7 @@ import (
 	"time"
 
 	"github.com/excalibase/watcher-go/internal/cdc"
-	_ "github.com/go-mysql-org/go-mysql/driver"
+	"github.com/go-mysql-org/go-mysql/driver"
 	"github.com/jackc/pgx/v5"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -27,13 +27,17 @@ import (
 const (
 	pgConnStr  = "postgres://e2euser:e2epass@localhost:15432/e2edb?sslmode=disable"
 	mysqlAddr  = "localhost:13306"
-	mysqlDSN   = "root:e2epass@localhost:13306/e2edb"
+	mysqlDSN   = "root:e2epass@localhost:13306/e2edb?ssl=custom"
 	natsURL    = "nats://localhost:14222"
 	healthPort = 18080
 )
 
 // watcherBin holds the path to the pre-built binary (set in TestMain)
 var watcherBin string
+
+// mysqlCA is the CA the e2e MySQL's certificate is signed by (EXC-589),
+// written by `make e2e-certs`; the watcher and the helpers verify with it.
+var mysqlCA string
 
 func TestMain(m *testing.M) {
 	// Build binary once
@@ -46,6 +50,23 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	watcherBin = binPath
+
+	ca, err := os.ReadFile(filepath.Join(projectRoot(), "e2e", "tls", "ca.pem"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "no MySQL CA (run make e2e-infra-up): %v\n", err)
+		os.Exit(1)
+	}
+	mysqlCA = string(ca)
+	if err := driver.SetCustomTLSConfig("mysql://"+mysqlAddr, ca, nil, nil, false, "localhost"); err != nil {
+		fmt.Fprintf(os.Stderr, "MySQL TLS: %v\n", err)
+		os.Exit(1)
+	}
+	// The watcher's login must use TLS, so a plaintext fallback cannot pass.
+	// The healthcheck answers on the socket before TCP is up, hence the retries.
+	if err := requireSSLForRoot(); err != nil {
+		fmt.Fprintf(os.Stderr, "MySQL REQUIRE SSL: %v\n", err)
+		os.Exit(1)
+	}
 
 	// Clean up stale Postgres replication slots from prior runs
 	ctx := context.Background()
@@ -80,6 +101,21 @@ func TestMain(m *testing.M) {
 
 	os.Remove(binPath)
 	os.Exit(code)
+}
+
+func requireSSLForRoot() error {
+	db, err := sql.Open("mysql", mysqlDSN)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	for i := 0; ; i++ {
+		_, err = db.Exec("ALTER USER 'root'@'%' REQUIRE SSL")
+		if err == nil || i == 60 {
+			return err
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // watcherProcess manages the real watcher binary subprocess
@@ -137,6 +173,7 @@ func startWatcherRaw(t *testing.T, cfgYAML string, waitForHealthReady bool) *wat
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, watcherBin, "--config", cfgFile)
+	cmd.Env = append(os.Environ(), "WATCHER_MYSQL_CA_CERT="+mysqlCA)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 

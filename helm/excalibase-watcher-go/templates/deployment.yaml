@@ -75,6 +75,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "excalibase-watcher-go.mysqlSecretName" . }}
                   key: {{ .Values.mysql.existingSecretPasswordKey }}
+            - name: WATCHER_MYSQL_CA_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "excalibase-watcher-go.mysqlSecretName" . }}
+                  key: {{ .Values.mysql.existingSecretCACertKey }}
             {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}

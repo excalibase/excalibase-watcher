@@ -64,6 +64,9 @@ type MySQLConfig struct {
 	SnapshotChunkSize  int      `mapstructure:"snapshot_chunk_size"`
 	SnapshotBackupFile string   `mapstructure:"snapshot_backup_file"`
 	OffsetFile         string   `mapstructure:"offset_file"`
+	// CACert is the PEM of the CA the server's certificate is signed by. The
+	// watcher connects only over TLS verified against it (EXC-589).
+	CACert string `mapstructure:"ca_cert"`
 }
 
 type NATSConfig struct {
@@ -151,6 +154,7 @@ func Load(cfgFile string) (*Config, error) {
 	v.BindEnv("mysql.host", "WATCHER_MYSQL_HOST")
 	v.BindEnv("mysql.username", "WATCHER_MYSQL_USERNAME")
 	v.BindEnv("mysql.password", "WATCHER_MYSQL_PASSWORD")
+	v.BindEnv("mysql.ca_cert", "WATCHER_MYSQL_CA_CERT")
 	v.BindEnv("nats.url", "WATCHER_NATS_URL")
 	v.BindEnv("nats.username", "WATCHER_NATS_USERNAME")
 	v.BindEnv("nats.password", "WATCHER_NATS_PASSWORD")

@@ -71,11 +71,18 @@ func (l *Listener) Start(ctx context.Context) error {
 	}
 	ctx, l.cancel = context.WithCancel(ctx)
 
+	// Checked before the snapshot, so nothing is published from a server
+	// the watcher will not connect to.
+	canalConfig, err := l.buildCanalConfig()
+	if err != nil {
+		return err
+	}
+
 	if err := l.runSnapshot(); err != nil {
 		return fmt.Errorf("snapshot: %w", err)
 	}
 
-	c, err := canal.NewCanal(l.buildCanalConfig())
+	c, err := canal.NewCanal(canalConfig)
 	if err != nil {
 		return fmt.Errorf("creating canal: %w", err)
 	}
@@ -114,8 +121,13 @@ func (l *Listener) Start(ctx context.Context) error {
 	return nil
 }
 
-func (l *Listener) buildCanalConfig() *canal.Config {
+func (l *Listener) buildCanalConfig() (*canal.Config, error) {
+	tlsConfig, err := serverTLS(l.cfg.CACert, l.cfg.Host)
+	if err != nil {
+		return nil, err
+	}
 	cfg := canal.NewDefaultConfig()
+	cfg.TLSConfig = tlsConfig
 	cfg.Addr = l.cfg.Host
 	cfg.User = l.cfg.Username
 	cfg.Password = l.cfg.Password
@@ -130,7 +142,7 @@ func (l *Listener) buildCanalConfig() *canal.Config {
 		cfg.IncludeTableRegex = append(cfg.IncludeTableRegex,
 			fmt.Sprintf(`^%s\.%s$`, regexp.QuoteMeta(l.cfg.Schema), regexp.QuoteMeta(t)))
 	}
-	return cfg
+	return cfg, nil
 }
 
 // resolveStartPosition returns the persisted offset, or the current master
