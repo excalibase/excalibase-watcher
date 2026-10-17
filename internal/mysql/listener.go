@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"math"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,17 +31,16 @@ type Listener struct {
 	running     atomic.Bool
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
-
-	// ackedLSNProvider returns the most recent binlog position confirmed
-	// by the downstream publisher (e.g., NATS). The listener advances its
-	// persisted offset based on this, guaranteeing offset ≤ delivered.
-	ackedLSNProvider func() string
+	gate        *commitGate
+	savedOffset BinlogPosition
 }
 
-// SetAckedLSNProvider wires up the durability source for offset saves.
-// Must be called before Start. Typically: listener.SetAckedLSNProvider(natsPub.LastAckedLSN).
-func (l *Listener) SetAckedLSNProvider(fn func() string) {
-	l.ackedLSNProvider = fn
+// PublishedObserver enables ack gating and returns the callback the NATS
+// publisher must invoke after each ack. Wire it before Start, so the offset
+// only advances past transactions NATS has fully acknowledged.
+func (l *Listener) PublishedObserver() func(cdc.Event) {
+	l.gate.Enable()
+	return l.gate.ObservePublished
 }
 
 func NewListener(cfg config.MySQLConfig, service *cdc.Service) (*Listener, error) {
@@ -55,6 +53,7 @@ func NewListener(cfg config.MySQLConfig, service *cdc.Service) (*Listener, error
 		cfg:         cfg,
 		service:     service,
 		offsetStore: store,
+		gate:        newCommitGate(),
 	}, nil
 }
 
@@ -74,7 +73,7 @@ func (l *Listener) Start(ctx context.Context) error {
 	}
 	l.canal = c
 
-	handler := &eventHandler{service: l.service, schema: l.cfg.Schema, offsetStore: l.offsetStore}
+	handler := &eventHandler{service: l.service, gate: l.gate}
 	c.SetEventHandler(handler)
 	l.handler = handler
 
@@ -89,7 +88,7 @@ func (l *Listener) Start(ctx context.Context) error {
 
 	l.running.Store(true)
 
-	if l.offsetStore != nil && l.ackedLSNProvider != nil {
+	if l.offsetStore != nil {
 		l.wg.Add(1)
 		go l.offsetSaver(ctx)
 	}
@@ -146,6 +145,8 @@ func (l *Listener) resolveStartPosition(c *canal.Canal) (*BinlogPosition, error)
 	if l.offsetStore != nil {
 		if err := l.offsetStore.Save(*startPos); err != nil {
 			slog.Warn("failed to save initial offset", "error", err)
+		} else {
+			l.savedOffset = *startPos
 		}
 	}
 	return startPos, nil
@@ -163,16 +164,16 @@ func (l *Listener) Stop() {
 	}
 	l.wg.Wait()
 
-	// Flush the final acked LSN — never the canal position — so restart
-	// re-delivers anything that wasn't acked.
-	if l.offsetStore != nil && l.ackedLSNProvider != nil {
-		if err := l.saveAckedOffset(); err != nil {
+	// Flush the last fully acked boundary — never the canal position — so
+	// restart re-delivers every transaction that wasn't fully acked.
+	if l.offsetStore != nil {
+		if err := l.saveConfirmedOffset(); err != nil {
 			slog.Warn("failed to flush final offset", "error", err)
 		}
 	}
 }
 
-// offsetSaver periodically persists the last-acked binlog position.
+// offsetSaver periodically persists the last fully acked transaction boundary.
 // Runs as a goroutine; exits when the context is cancelled.
 func (l *Listener) offsetSaver(ctx context.Context) {
 	defer l.wg.Done()
@@ -183,31 +184,25 @@ func (l *Listener) offsetSaver(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := l.saveAckedOffset(); err != nil {
-				slog.Warn("failed to save acked offset", "error", err)
+			if err := l.saveConfirmedOffset(); err != nil {
+				slog.Warn("failed to save confirmed offset", "error", err)
 			}
 		}
 	}
 }
 
-// saveAckedOffset parses the last-acked LSN ("file:pos") and writes it to the
-// offset store. Returns nil if there's nothing to save.
-func (l *Listener) saveAckedOffset() error {
-	lsn := l.ackedLSNProvider()
-	if lsn == "" {
+// saveConfirmedOffset writes the newest boundary whose events are all acked,
+// when it moved since the last save.
+func (l *Listener) saveConfirmedOffset() error {
+	pos, ok := l.gate.Confirmable()
+	if !ok || pos == l.savedOffset {
 		return nil
 	}
-	colon := strings.LastIndex(lsn, ":")
-	if colon < 0 {
-		return fmt.Errorf("invalid acked LSN %q", lsn)
+	if err := l.offsetStore.Save(pos); err != nil {
+		return err
 	}
-	file := lsn[:colon]
-	posStr := lsn[colon+1:]
-	pos, err := strconv.ParseUint(posStr, 10, 32)
-	if err != nil {
-		return fmt.Errorf("invalid position in LSN %q: %w", lsn, err)
-	}
-	return l.offsetStore.Save(BinlogPosition{File: file, Position: uint32(pos)})
+	l.savedOffset = pos
+	return nil
 }
 
 func (l *Listener) IsRunning() bool {
@@ -245,18 +240,24 @@ func (l *Listener) runSnapshot() error {
 // eventHandler implements canal.EventHandler
 type eventHandler struct {
 	canal.DummyEventHandler
-	service     *cdc.Service
-	schema      string
-	offsetStore OffsetStore
-	eventCount  int64
-	lastSave    time.Time
+	service *cdc.Service
+	gate    *commitGate
 
-	// Position tracking for at-least-once offset semantics.
-	// lastPos is the most recent committed position (from OnXID).
 	// currentFile is updated by OnRotate; OnRow combines it with Header.LogPos.
 	lastPosMu   sync.Mutex
-	lastPos     mysql.Position
 	currentFile string
+}
+
+// emit passes an event to the bus and counts it toward the commit gate when
+// it will be published.
+func (h *eventHandler) emit(event cdc.Event) {
+	if h.service.HandleEvent(event) && ownEvent(event) {
+		h.gate.Hand()
+	}
+}
+
+func (h *eventHandler) committed(pos mysql.Position) {
+	h.gate.Committed(BinlogPosition{File: pos.Name, Position: pos.Pos})
 }
 
 // currentBinlogFile returns the current binlog filename (tracked via OnRotate).
@@ -279,9 +280,9 @@ func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
 	// All rows of one rows event share its position; the row index tells them apart.
 	publish := func(event cdc.Event, row int) {
 		if lsn != "" {
-			event.SourceID = fmt.Sprintf("mysql:%s:%d", lsn, row)
+			event.SourceID = fmt.Sprintf("%s%s:%d", sourcePrefix, lsn, row)
 		}
-		h.service.HandleEvent(event)
+		h.emit(event)
 	}
 
 	switch e.Action {
@@ -307,11 +308,13 @@ func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
 }
 
 // OnRotate tracks the current binlog file so OnRow can stamp events with
-// the correct position.
+// the correct position. A rotate falls between transactions, so it is a
+// boundary too: an idle offset moves on to the new file.
 func (h *eventHandler) OnRotate(_ *replication.EventHeader, ev *replication.RotateEvent) error {
 	h.lastPosMu.Lock()
 	h.currentFile = string(ev.NextLogName)
 	h.lastPosMu.Unlock()
+	h.committed(mysql.Position{Name: string(ev.NextLogName), Pos: uint32(ev.Position)})
 	return nil
 }
 
@@ -321,23 +324,18 @@ func (h *eventHandler) OnDDL(_ *replication.EventHeader, nextPos mysql.Position,
 	// Match Java format: raw SQL as data field
 	event := cdc.NewEvent(cdc.DDL, ddlSchema, "", query, "DDL", "")
 	if nextPos.Name != "" {
-		event.SourceID = fmt.Sprintf("mysql:%s:%d:ddl", nextPos.Name, nextPos.Pos)
+		event.SourceID = fmt.Sprintf("%s%s:%d:ddl", sourcePrefix, nextPos.Name, nextPos.Pos)
 	}
-	h.service.HandleEvent(event)
+	h.emit(event)
+	h.committed(nextPos)
 	return nil
 }
 
+// OnXID closes a transaction. Its position is only persisted once every row
+// handed before it is acked (see commitGate), never per rows event.
 func (h *eventHandler) OnXID(_ *replication.EventHeader, nextPos mysql.Position) error {
-	event := cdc.NewEvent(cdc.Commit, "", "", "", "COMMIT", "")
-	h.service.HandleEvent(event)
-
-	h.lastPosMu.Lock()
-	h.lastPos = nextPos
-	h.lastPosMu.Unlock()
-
-	// Do NOT save offset here. Offset is driven by NATS publisher's
-	// LastAckedLSN to guarantee we never save a position ahead of delivery.
-	// See Listener.offsetSaver goroutine.
+	h.service.HandleEvent(cdc.NewEvent(cdc.Commit, "", "", "", "COMMIT", ""))
+	h.committed(nextPos)
 	return nil
 }
 

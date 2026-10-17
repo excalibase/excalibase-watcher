@@ -32,10 +32,11 @@ type Publisher struct {
 	failed         chan error
 	reconnect      backoff
 
-	// lastAckedLSN is updated after every successful js.Publish ack.
-	// Offset-persisting listeners read this to advance storage safely.
+	// lastAckedLSN is updated after every successful js.Publish ack. It is
+	// informational: listeners gate their positions through observers.
 	lastAckedLSN atomic.Value // string
-	onPublished  atomic.Pointer[func(cdc.Event)]
+	observersMu  sync.Mutex
+	observers    atomic.Pointer[[]func(cdc.Event)]
 
 	// publishFn performs one publish attempt; tests substitute a fake.
 	publishFn      func(ctx context.Context, subject string, data []byte, msgID string) error
@@ -66,11 +67,19 @@ func (p *Publisher) LastAckedLSN() string {
 	return v
 }
 
-// SetOnPublished registers a callback invoked after each successful publish.
-// The callback runs on the publisher goroutine, so it must be fast and
+// AddOnPublished registers a callback invoked after each successful publish;
+// each listener that gates its source position on acks adds its own.
+// Callbacks run on the publisher goroutine, so they must be fast and
 // non-blocking (writing to a channel or atomic is fine). Safe to call after Start.
-func (p *Publisher) SetOnPublished(fn func(cdc.Event)) {
-	p.onPublished.Store(&fn)
+func (p *Publisher) AddOnPublished(fn func(cdc.Event)) {
+	p.observersMu.Lock()
+	defer p.observersMu.Unlock()
+	var observers []func(cdc.Event)
+	if current := p.observers.Load(); current != nil {
+		observers = append(observers, *current...)
+	}
+	observers = append(observers, fn)
+	p.observers.Store(&observers)
 }
 
 // Ready reports whether events can be published right now: connected, with
@@ -290,8 +299,10 @@ func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 	if event.LSN != "" {
 		p.lastAckedLSN.Store(event.LSN)
 	}
-	if fn := p.onPublished.Load(); fn != nil {
-		(*fn)(event)
+	if observers := p.observers.Load(); observers != nil {
+		for _, observe := range *observers {
+			observe(event)
+		}
 	}
 	return nil
 }

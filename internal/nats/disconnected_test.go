@@ -58,7 +58,7 @@ func TestPublishLoopStopsOnceTheConnectionIsClosed(t *testing.T) {
 	conn.Close()
 	p.conn.Store(conn)
 	var acked atomic.Int32
-	p.SetOnPublished(func(cdc.Event) { acked.Add(1) })
+	p.AddOnPublished(func(cdc.Event) { acked.Add(1) })
 
 	ch := make(chan cdc.Event, 2)
 	ch <- cdc.NewEvent(cdc.Insert, "public", "users", `{"id":1}`, "INSERT", "0/1")

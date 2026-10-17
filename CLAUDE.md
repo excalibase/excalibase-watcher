@@ -32,9 +32,9 @@ Code: `internal/nats/publisher.go::ensureStream`.
 ### 2. **Offset save follows NATS ack, NOT canal's XID position.**
 Canal's `OnXID` used to save the binlog offset after each transaction. But `HandleEvent` is non-blocking on the channel — events can be buffered (100k) and not yet published when canal moves past them. A crash between "offset saved" and "publisher acked" = data loss.
 
-Now: the NATS publisher updates `lastAckedLSN` atomically after each successful `js.Publish` ack. The MySQL listener runs a background `offsetSaver` goroutine that polls `publisher.LastAckedLSN()` every 1 s and persists that position. Offset is always ≤ delivered. Crash = re-read from binlog starting at the last acked position. At-least-once holds.
+Now: the MySQL `commitGate` counts every publishable event handed to the bus and every one JetStream acked (`Publisher.AddOnPublished`). It only confirms transaction boundaries (after XID, DDL, rotate), and only once every event handed before the boundary is acked. The `offsetSaver` goroutine persists the confirmed boundary every 1 s. Never persist a rows event's position: all rows of a multi-row event share it, so a crash after some rows were acked would resume after the rest (EXC-509). Crash = the unconfirmed transactions replay whole; rows already published carry the same source id (`mysql:file:pos:row`) and the stream drops them as duplicates. At-least-once holds.
 
-Code: `internal/mysql/listener.go::offsetSaver`, `internal/nats/publisher.go::lastAckedLSN`.
+Code: `internal/mysql/ackgate.go`, `internal/mysql/listener.go::offsetSaver`.
 
 ### 3. **No silent event drops.**
 Originally, `HandleEvent` did `select { case sub.ch <- event; default: drop }`. Under any backpressure, events vanished with just a log line. Fixed by switching to a blocking send with rate-limited backpressure logging (once per 10 s per subscriber). If NATS is slow, canal eventually blocks — which is correct: MySQL retains the binlog, we catch up when NATS recovers.
@@ -94,7 +94,7 @@ See `docs/JAVA_PARITY.md` for the full list.
 - **`replication=database` must be in the connection string** or `START_REPLICATION` fails with a cryptic syntax error. `pgjdbc` does this implicitly; Go does not.
 - **Acknowledge with `lastReceivedLSN + 1`**, not `lastReceivedLSN`. `pgjdbc` does the `+1` internally; Go requires it explicit.
 - **`excalibase_cdc_slot_owners` is watcher-internal.** Its heartbeat UPDATEs flow through the publication (FOR ALL TABLES) and are dropped in `Parser.passesFilter`. The registry row is claimed BEFORE the slot is created (so a concurrent cleaner never sees an unowned slot) and released in `Stop()`; the pause flow must SIGTERM the watcher before hibernating the cluster or `released_at` can't be written.
-- **The Postgres ack is gated on the NATS ack.** `ackGate` (listener.go / ackgate.go) tracks the LSN of the last publishable event handed to the bus vs. the last one JetStream acked (`Publisher.SetOnPublished`), and `sendStatus` confirms only the acked position while anything is outstanding. Wire the observer BEFORE `Listener.Start`, otherwise early events are never observed and the gate holds forever. Keepalive positions (`ServerWALEnd`) are received and confirmed too, so `restart_lsn` advances during idle periods.
+- **The Postgres ack is gated on the NATS ack.** `ackGate` (listener.go / ackgate.go) tracks the LSN of the last publishable event handed to the bus vs. the last one JetStream acked (`Publisher.AddOnPublished`), and `sendStatus` confirms only the acked position while anything is outstanding. Wire the observer BEFORE `Listener.Start`, otherwise early events are never observed and the gate holds forever. Keepalive positions (`ServerWALEnd`) are received and confirmed too, so `restart_lsn` advances during idle periods.
 - **Snapshot connection needs a different URL** — strip `replication=database` before using `pgx.Connect` for snapshot queries (otherwise you get a replication connection which can't run normal SELECTs).
 - **`CREATE PUBLICATION FOR ALL TABLES` captures future tables too.** Good — but be aware that creating the publication happens at watcher startup, so any table created **before** the publication existed may not be included until it's rediscovered via DDL.
 - **pgoutput column marker `u`** means "unchanged (TOAST)" — serialize as `"unchanged"` string, not skip the column.
@@ -157,10 +157,11 @@ internal/
     snapshot_dump.go             # pg_dump COPY format parser
   mysql/
     listener.go                  # canal-based binlog consumer, offsetSaver goroutine
+    ackgate.go                   # persists only fully acked transaction boundaries
     offset.go                    # FileOffsetStore
     snapshot_dump.go             # mysqldump INSERT parser
   nats/
-    publisher.go                 # JetStream publisher, LastAckedLSN tracking
+    publisher.go                 # JetStream publisher, ack observers (one per gated listener)
     connection.go                # never-give-up connect options, jittered backoff, readiness
   natstest/                      # (integration tag) in-process NATS that can be taken down and brought back
   jsonutil/escape.go             # Shared RFC 8259 JSON string escape

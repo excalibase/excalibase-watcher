@@ -124,7 +124,7 @@ func startPostgres(ctx context.Context, cfg *config.Config, service *cdc.Service
 	if pub != nil {
 		// Wired before Start so no event can be published without being observed;
 		// the slot is only confirmed up to what NATS has acknowledged.
-		pub.SetOnPublished(pgListener.PublishedObserver())
+		pub.AddOnPublished(pgListener.PublishedObserver())
 	}
 	if err := pgListener.Start(ctx); err != nil {
 		return nil, fmt.Errorf("starting postgres listener: %w", err)
@@ -143,7 +143,9 @@ func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, p
 		return nil, fmt.Errorf("creating mysql listener: %w", err)
 	}
 	if pub != nil {
-		mysqlListener.SetAckedLSNProvider(pub.LastAckedLSN)
+		// Wired before Start: the offset only advances past transactions
+		// whose every row NATS has acknowledged.
+		pub.AddOnPublished(mysqlListener.PublishedObserver())
 	}
 	if err := mysqlListener.Start(ctx); err != nil {
 		return nil, fmt.Errorf("starting mysql listener: %w", err)
