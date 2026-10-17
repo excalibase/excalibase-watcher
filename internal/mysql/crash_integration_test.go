@@ -96,11 +96,26 @@ func waitForStreamMsgs(t *testing.T, js jetstream.JetStream, stream string, want
 	}
 }
 
-// One INSERT of five rows is one binlog rows event. The stream only accepts
-// two messages, so the watcher is stuck with rows 1-2 acked and 3-5 pending
-// when it crashes. After restart every row must be in the stream exactly once.
-func TestCrashMidRowsEventLosesNoRow(t *testing.T) {
-	addr, _, cleanup := setupMySQL(t)
+func insertRows(t *testing.T, addr, prefix string, count int) []string {
+	t.Helper()
+	names := make([]string, count)
+	values := make([]string, count)
+	for i := range names {
+		names[i] = fmt.Sprintf("%s-%d", prefix, i+1)
+		values[i] = fmt.Sprintf("('%s')", names[i])
+	}
+	execMySQL(t, addr, "INSERT INTO cdc_test_users (name) VALUES "+strings.Join(values, ", "))
+	return names
+}
+
+// Two transactions of three rows each, every transaction one multi-row
+// INSERT. The stream accepts four messages, so the watcher is stuck in the
+// middle of the second transaction's rows event when it crashes. After the
+// restart every row must be in the stream exactly once: none skipped, and
+// rows already published deduplicated by a message id that is the same on
+// the replay and different for every row.
+func crashMidTransactionLosesNoRow(t *testing.T, mysqlFlags ...string) {
+	addr, _, cleanup := setupMySQLWithFlags(t, mysqlFlags...)
 	defer cleanup()
 	ctx := context.Background()
 
@@ -113,7 +128,7 @@ func TestCrashMidRowsEventLosesNoRow(t *testing.T) {
 	streamCfg := jetstream.StreamConfig{
 		Name: natsCfg.StreamName, Subjects: []string{natsCfg.SubjectPrefix + ".>"},
 		Storage: jetstream.FileStorage, Duplicates: 10 * time.Minute,
-		MaxMsgs: 2, Discard: jetstream.DiscardNew,
+		MaxMsgs: 4, Discard: jetstream.DiscardNew,
 	}
 	if _, err := js.CreateStream(ctx, streamCfg); err != nil {
 		t.Fatalf("create stream: %v", err)
@@ -126,15 +141,11 @@ func TestCrashMidRowsEventLosesNoRow(t *testing.T) {
 	first := startWatcherProcess(t, mysqlCfg, natsCfg)
 	time.Sleep(3 * time.Second)
 
-	const rowCount = 5
-	values := make([]string, rowCount)
-	for i := range values {
-		values[i] = fmt.Sprintf("('row-%d')", i+1)
-	}
-	execMySQL(t, addr, "INSERT INTO cdc_test_users (name) VALUES "+strings.Join(values, ", "))
+	names := insertRows(t, addr, "a", 3)
+	names = append(names, insertRows(t, addr, "b", 3)...)
 
-	waitForStreamMsgs(t, js, natsCfg.StreamName, 2, 30*time.Second)
-	time.Sleep(3 * time.Second) // let the offset saver run while rows 3-5 are stuck
+	waitForStreamMsgs(t, js, natsCfg.StreamName, 4, 30*time.Second)
+	time.Sleep(3 * time.Second) // let the offset saver run while b-2 and b-3 are stuck
 	first.crash()
 
 	streamCfg.MaxMsgs = -1
@@ -144,14 +155,24 @@ func TestCrashMidRowsEventLosesNoRow(t *testing.T) {
 
 	second := startWatcherProcess(t, mysqlCfg, natsCfg)
 	defer second.crash()
-	waitForStreamMsgs(t, js, natsCfg.StreamName, rowCount, 60*time.Second)
+	waitForStreamMsgs(t, js, natsCfg.StreamName, uint64(len(names)), 60*time.Second)
 	time.Sleep(2 * time.Second)
 
-	names := streamedRowNames(t, js, natsCfg.StreamName)
-	for i := 1; i <= rowCount; i++ {
-		name := fmt.Sprintf("row-%d", i)
-		if names[name] != 1 {
-			t.Errorf("%s published %d times, want exactly once", name, names[name])
+	streamed := streamedRowNames(t, js, natsCfg.StreamName)
+	for _, name := range names {
+		if streamed[name] != 1 {
+			t.Errorf("%s published %d times, want exactly once", name, streamed[name])
 		}
 	}
+}
+
+func TestCrashMidRowsEventLosesNoRow(t *testing.T) {
+	crashMidTransactionLosesNoRow(t)
+}
+
+// Events inside a compressed transaction payload carry binlog position 0, so
+// a position-based message id would be the same for the first row of every
+// compressed transaction and the stream would drop all but one of them.
+func TestCompressedTransactionsLoseNoRow(t *testing.T) {
+	crashMidTransactionLosesNoRow(t, "--binlog-transaction-compression=ON")
 }

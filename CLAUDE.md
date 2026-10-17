@@ -86,6 +86,7 @@ See `docs/JAVA_PARITY.md` for the full list.
 
 - **`Dump.ExecutionPath=""` → starts at position 0.** Explicit `GetMasterPos` + `RunFrom` is required. See invariant #4.
 - **All rows in one `WRITE_ROWS` batch share `Header.LogPos`.** When you batch-insert 50 rows in one statement, all 50 OnRow calls carry the same LSN. Don't use LSN as an event primary key.
+- **Compressed transactions carry position 0.** With `binlog_transaction_compression=ON` (MOCO's default) every event inside the payload, XID included, has `LogPos` 0. Their rows are identified by the enclosing transaction (end of its GTID event, `OnGTID`) plus their order in it, and the GTID event's start is the resume boundary. A row that can be placed by neither stops the watcher (`Listener.Failed`) instead of being published under a colliding id (EXC-509).
 - **Canal's `currentFile` is tracked via `OnRotate`**, not provided on `OnRow`. You must combine `OnRotate`'s `NextLogName` with `Header.LogPos` to reconstruct the full position. We seed `currentFile` from `startPos.File` so we have a value before the first rotate.
 - **`MYSQL_PWD` in healthcheck, not `-pXXX`.** `-p` on the mysqladmin command line exposes the password in `ps`. Use env var.
 
