@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/viper"
 )
@@ -172,7 +173,28 @@ func Load(cfgFile string) (*Config, error) {
 		return nil, fmt.Errorf("mysql: %w", err)
 	}
 
+	if err := ValidateSubjectPrefix(cfg.NATS.SubjectPrefix); err != nil {
+		return nil, fmt.Errorf("nats: %w", err)
+	}
+
 	return &cfg, nil
+}
+
+// ValidateSubjectPrefix refuses a prefix no event could be published under, so
+// a typo stops the watcher at startup instead of dropping every event.
+func ValidateSubjectPrefix(prefix string) error {
+	if prefix == "" {
+		return fmt.Errorf("subject_prefix is empty")
+	}
+	for _, r := range prefix {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r == '*' || r == '>' {
+			return fmt.Errorf("invalid subject_prefix %q: whitespace, control characters and wildcards are not allowed", prefix)
+		}
+	}
+	if strings.HasPrefix(prefix, ".") || strings.HasSuffix(prefix, ".") || strings.Contains(prefix, "..") {
+		return fmt.Errorf("invalid subject_prefix %q: empty token", prefix)
+	}
+	return nil
 }
 
 func defaultOwnerID() string {

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -394,3 +395,43 @@ func TestMySQLServerCAFromTheEnvironment(t *testing.T) {
 		t.Errorf("mysql.ca_cert = %q", cfg.MySQL.CACert)
 	}
 }
+
+func TestLoadRejectsBadSubjectPrefix(t *testing.T) {
+	for name, prefix := range map[string]string{
+		"trailing dot":  "cdc.",
+		"leading dot":   ".cdc",
+		"empty token":   "cdc..bad",
+		"space":         "cdc bad",
+		"tab":           "cdc\tbad",
+		"control char":  "cdc\x00",
+		"star wildcard": "cdc.*",
+		"gt wildcard":   "cdc.>",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+			body := "nats:\n  subject_prefix: " + strconvQuote(prefix) + "\n"
+			if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(cfgFile); err == nil {
+				t.Fatalf("Load accepted subject_prefix %q", prefix)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsDottedSubjectPrefix(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("nats:\n  subject_prefix: excalibase.cdc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgFile)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATS.SubjectPrefix != "excalibase.cdc" {
+		t.Errorf("prefix = %q", cfg.NATS.SubjectPrefix)
+	}
+}
+
+func strconvQuote(s string) string { return strconv.Quote(s) }

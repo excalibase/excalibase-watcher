@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/config"
@@ -285,6 +286,15 @@ func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 	subject := buildSubject(p.cfg.SubjectPrefix, event.Schema, event.Table)
 	msgID := p.messageID(event)
 
+	if err := validateSubject(subject); err != nil {
+		// Retrying cannot fix it; acknowledging lets the source position move on.
+		slog.Error("skipping event with an invalid NATS subject",
+			"type", event.Type.String(), "schema", event.Schema, "table", event.Table, "lsn", event.LSN, "error", err)
+		metrics.IncNATSError()
+		p.notifyPublished(event)
+		return nil
+	}
+
 	err := p.send(ctx, subject, event, msgID)
 	if isTooLarge(err) {
 		err = p.sendTruncated(ctx, subject, event, msgID)
@@ -299,12 +309,16 @@ func (p *Publisher) publish(ctx context.Context, event cdc.Event) error {
 	if event.LSN != "" {
 		p.lastAckedLSN.Store(event.LSN)
 	}
+	p.notifyPublished(event)
+	return nil
+}
+
+func (p *Publisher) notifyPublished(event cdc.Event) {
 	if observers := p.observers.Load(); observers != nil {
 		for _, observe := range *observers {
 			observe(event)
 		}
 	}
-	return nil
 }
 
 func (p *Publisher) send(ctx context.Context, subject string, event cdc.Event, msgID string) error {
@@ -390,14 +404,32 @@ func buildSubject(prefix, schema, table string) string {
 	return prefix + "." + sanitizeSubjectToken(schema) + "." + sanitizeSubjectToken(table)
 }
 
-// sanitizeSubjectToken replaces NATS wildcard characters to prevent subject injection.
+// sanitizeSubjectToken replaces NATS wildcards and token separators (subject
+// injection) and whitespace/control characters (the server rejects them).
 func sanitizeSubjectToken(s string) string {
-	return strings.NewReplacer(
-		".", "_",
-		"*", "_",
-		">", "_",
-		" ", "_",
-	).Replace(s)
+	return strings.Map(func(r rune) rune {
+		if r == '.' || r == '*' || r == '>' || unicode.IsSpace(r) || unicode.IsControl(r) {
+			return '_'
+		}
+		return r
+	}, s)
+}
+
+// validateSubject reports why a subject can never be published, so the event
+// is skipped instead of retried forever.
+func validateSubject(subject string) error {
+	if subject == "" {
+		return errors.New("empty subject")
+	}
+	for _, r := range subject {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("subject %q contains whitespace or a control character", subject)
+		}
+	}
+	if strings.HasPrefix(subject, ".") || strings.HasSuffix(subject, ".") || strings.Contains(subject, "..") {
+		return fmt.Errorf("subject %q has an empty token", subject)
+	}
+	return nil
 }
 
 func shouldPublish(t cdc.EventType) bool {
