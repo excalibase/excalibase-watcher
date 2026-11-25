@@ -15,7 +15,7 @@ import (
 // mysqldump writes the set the dump already contains, which is where the
 // binlog stream must pick up. A long set runs over several lines.
 var (
-	gtidPurgedStart = regexp.MustCompile(`GTID_PURGED\s*=\s*(?:/\*!\d+ '\+'\*/\s*)?'([^']*)('?)`)
+	gtidPurgedStart = regexp.MustCompile(`^\s*SET\s+@@(?:GLOBAL\.)?GTID_PURGED\s*=\s*(?:/\*!\d+ '\+'\*/\s*)?'([^']*)('?)`)
 )
 
 // INSERT INTO `table` VALUES (...),(...);

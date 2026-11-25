@@ -70,9 +70,14 @@ type MySQLConfig struct {
 	// OffsetBucket instead, which is what Kubernetes wants.
 	OffsetFile   string `mapstructure:"offset_file"`
 	OffsetBucket string `mapstructure:"offset_bucket"`
-	// ResetOffset discards the saved offset for one start and streams from the
-	// server's current position: the way out of a purged or foreign offset.
-	ResetOffset bool `mapstructure:"reset_offset"`
+	// OffsetReplicas is how many NATS servers keep the offset bucket (1 to 5).
+	// A cluster with fewer servers gets the most it can hold.
+	OffsetReplicas int `mapstructure:"offset_replicas"`
+	// ResetOffset is a token. A start that sees a token it has not used yet
+	// discards the saved offset and streams from the server's current
+	// position: the way out of a purged, lost or foreign offset. The token is
+	// stored with the offset, so leaving it set does not reset again.
+	ResetOffset string `mapstructure:"reset_offset"`
 	// CACert is the PEM of the CA the server's certificate is signed by. The
 	// watcher connects only over TLS verified against it (EXC-589).
 	CACert string `mapstructure:"ca_cert"`
@@ -130,6 +135,7 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("mysql.snapshot_mode", "none")
 	v.SetDefault("mysql.snapshot_chunk_size", 10000)
 	v.SetDefault("mysql.offset_bucket", "WATCHER_MYSQL_OFFSETS")
+	v.SetDefault("mysql.offset_replicas", 3)
 
 	// Defaults — NATS
 	v.SetDefault("nats.enabled", true)
@@ -167,6 +173,7 @@ func Load(cfgFile string) (*Config, error) {
 	v.BindEnv("mysql.ca_cert", "WATCHER_MYSQL_CA_CERT")
 	v.BindEnv("mysql.reset_offset", "WATCHER_MYSQL_RESET_OFFSET")
 	v.BindEnv("mysql.offset_bucket", "WATCHER_MYSQL_OFFSET_BUCKET")
+	v.BindEnv("mysql.offset_replicas", "WATCHER_MYSQL_OFFSET_REPLICAS")
 	v.BindEnv("nats.url", "WATCHER_NATS_URL")
 	v.BindEnv("nats.username", "WATCHER_NATS_USERNAME")
 	v.BindEnv("nats.password", "WATCHER_NATS_PASSWORD")
@@ -184,8 +191,13 @@ func Load(cfgFile string) (*Config, error) {
 		return nil, fmt.Errorf("mysql: %w", err)
 	}
 
-	if !bucketName.MatchString(cfg.MySQL.OffsetBucket) {
-		return nil, fmt.Errorf("mysql: invalid offset_bucket %q: use letters, digits, - and _", cfg.MySQL.OffsetBucket)
+	if cfg.MySQL.Enabled {
+		if !bucketName.MatchString(cfg.MySQL.OffsetBucket) {
+			return nil, fmt.Errorf("mysql: invalid offset_bucket %q: use letters, digits, - and _", cfg.MySQL.OffsetBucket)
+		}
+		if cfg.MySQL.OffsetReplicas < 1 || cfg.MySQL.OffsetReplicas > 5 {
+			return nil, fmt.Errorf("mysql: offset_replicas %d: must be 1 to 5", cfg.MySQL.OffsetReplicas)
+		}
 	}
 
 	if err := ValidateSubjectPrefix(cfg.NATS.SubjectPrefix); err != nil {

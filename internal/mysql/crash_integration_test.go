@@ -141,7 +141,7 @@ func crashMidTransactionLosesNoRow(t *testing.T, useKV bool, mysqlFlags ...strin
 	mysqlCfg.Tables = []string{"cdc_test_users"}
 	var store OffsetStore
 	if useKV {
-		kv, err := NewKVOffsetStore(ctx, js, "OFFSETS", OffsetKey(natsCfg.SubjectPrefix, mysqlCfg.Schema))
+		kv, err := NewKVOffsetStore(ctx, js, "OFFSETS", OffsetKey(natsCfg.SubjectPrefix, mysqlCfg.Schema), 1)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -148,7 +148,7 @@ func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, p
 		pub.AddOnPublished(mysqlListener.PublishedObserver())
 		if cfg.MySQL.OffsetFile == "" {
 			store, err := mysqllistener.NewKVOffsetStore(ctx, pub.JetStream(), cfg.MySQL.OffsetBucket,
-				mysqllistener.OffsetKey(cfg.NATS.SubjectPrefix, cfg.MySQL.Schema))
+				mysqllistener.OffsetKey(cfg.NATS.SubjectPrefix, cfg.MySQL.Schema), cfg.MySQL.OffsetReplicas)
 			if err != nil {
 				return nil, fmt.Errorf("opening mysql offset store: %w", err)
 			}

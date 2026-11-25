@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -152,5 +153,62 @@ func TestAnUnreadableGTIDEventStopsTheWatcher(t *testing.T) {
 	h, _ := newHandler(t, "")
 	if err := h.OnGTID(nil, fakeGTID{"garbage"}); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+func TestAnonymousGTIDStopsTheWatcher(t *testing.T) {
+	h, _ := newHandler(t, "")
+	anonymous := &replication.GTIDEvent{SID: make([]byte, 16), GNO: 0}
+	if err := h.OnGTID(nil, anonymous); !errors.Is(err, errAnonymousGTID) {
+		t.Fatalf("err = %v, want errAnonymousGTID", err)
+	}
+	zeroSID := &replication.GTIDEvent{SID: make([]byte, 16), GNO: 7}
+	if err := h.OnGTID(nil, zeroSID); !errors.Is(err, errAnonymousGTID) {
+		t.Fatalf("zero SID: err = %v, want errAnonymousGTID", err)
+	}
+	sid := []byte("0123456789abcdef")
+	if err := h.OnGTID(nil, &replication.GTIDEvent{SID: sid, GNO: 0}); !errors.Is(err, errAnonymousGTID) {
+		t.Fatalf("GNO 0: err = %v, want errAnonymousGTID", err)
+	}
+	if err := h.OnGTID(nil, fakeGTID{""}); !errors.Is(err, errAnonymousGTID) {
+		t.Fatalf("empty GTID: err = %v, want errAnonymousGTID", err)
+	}
+	if h.open != nil {
+		t.Fatal("a refused GTID opened a transaction")
+	}
+}
+
+func TestATaggedGTIDStopsTheWatcher(t *testing.T) {
+	h, _ := newHandler(t, "")
+	tagged := &replication.GtidTaggedLogEvent{GTIDEvent: replication.GTIDEvent{SID: []byte("0123456789abcdef"), GNO: 3}}
+	if err := h.OnGTID(nil, tagged); !errors.Is(err, errTaggedGTID) {
+		t.Fatalf("err = %v, want errTaggedGTID", err)
+	}
+}
+
+// After a commit the transaction is over: a row that arrives with no new GTID
+// must hit the guard instead of reusing the finished transaction's ids.
+func TestRowAfterACommitHasNoTransaction(t *testing.T) {
+	h, ch := newHandler(t, serverA+":1-3")
+	mustDo(t, h.OnGTID(nil, txnGTID(4)))
+	mustDo(t, h.OnRow(rowsEvent(100, 1)))
+	mustDo(t, h.OnXID(nil, gomysql.Position{}))
+	<-ch
+	<-ch
+	if err := h.OnRow(rowsEvent(200, 2)); !errors.Is(err, errUnplacedRow) {
+		t.Fatalf("err = %v, want errUnplacedRow", err)
+	}
+	if h.open != nil || h.events != 0 {
+		t.Fatalf("transaction not cleared: open=%v events=%d", h.open, h.events)
+	}
+}
+
+func TestDDLAfterACommitHasNoTransaction(t *testing.T) {
+	h, _ := newHandler(t, serverA+":1-3")
+	mustDo(t, h.OnGTID(nil, txnGTID(4)))
+	mustDo(t, h.OnXID(nil, gomysql.Position{}))
+	err := h.OnDDL(nil, gomysql.Position{}, &replication.QueryEvent{Query: []byte("DROP TABLE t")})
+	if !errors.Is(err, errUnplacedRow) {
+		t.Fatalf("err = %v, want errUnplacedRow", err)
 	}
 }

@@ -8,23 +8,42 @@ import (
 	"sync"
 )
 
-// OffsetStore keeps the GTID set of the last transaction that was published
-// and acknowledged. An empty set means nothing has been saved.
+// OffsetRecord is what a watcher keeps between runs: the GTID set of the last
+// transaction that was published and acknowledged (empty means nothing yet),
+// and the last reset token it has used.
+type OffsetRecord struct {
+	GTIDSet    string `json:"gtid_set"`
+	ResetToken string `json:"reset_token,omitempty"`
+	// File is retired: an offset written before resume by GTID.
+	File string `json:"file,omitempty"`
+}
+
 type OffsetStore interface {
-	Save(gtidSet string) error
-	Load() (string, error)
-	Clear() error
+	Save(record OffsetRecord) error
+	Load() (OffsetRecord, error)
 }
 
 // ErrLegacyOffset is an offset written before resume by GTID: a binlog file
 // and position, which means nothing on another replica.
 var ErrLegacyOffset = errors.New("mysql: the saved offset is a binlog file and position from before resume by GTID; " +
-	"set mysql.reset_offset (WATCHER_MYSQL_RESET_OFFSET=true) for one start to begin from the server's current position")
+	"set mysql.reset_offset (WATCHER_MYSQL_RESET_OFFSET) to a new token for one start to begin from the server's current position")
 
-type savedOffset struct {
-	GTIDSet string `json:"gtid_set"`
-	// Retired fields, read only to tell a legacy offset from an empty one.
-	File string `json:"file,omitempty"`
+// usable refuses a record the watcher cannot resume from.
+func (r OffsetRecord) usable() error {
+	if r.GTIDSet == "" && r.File != "" {
+		return ErrLegacyOffset
+	}
+	return nil
+}
+
+// applyResetToken discards the saved offset when the token is one this
+// watcher has not used yet, and remembers the token so a restart that still
+// carries it keeps the offset.
+func applyResetToken(saved OffsetRecord, token string) (OffsetRecord, bool) {
+	if token == "" || saved.ResetToken == token {
+		return saved, false
+	}
+	return OffsetRecord{ResetToken: token}, true
 }
 
 // FileOffsetStore writes the offset to a file; on Kubernetes the file must
@@ -38,11 +57,11 @@ func NewFileOffsetStore(path string) *FileOffsetStore {
 	return &FileOffsetStore{path: path}
 }
 
-func (s *FileOffsetStore) Save(gtidSet string) error {
+func (s *FileOffsetStore) Save(record OffsetRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := json.Marshal(savedOffset{GTIDSet: gtidSet})
+	data, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
@@ -53,32 +72,20 @@ func (s *FileOffsetStore) Save(gtidSet string) error {
 	return os.Rename(tmpPath, s.path)
 }
 
-func (s *FileOffsetStore) Load() (string, error) {
+func (s *FileOffsetStore) Load() (OffsetRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	data, err := os.ReadFile(s.path)
 	if os.IsNotExist(err) {
-		return "", nil
+		return OffsetRecord{}, nil
 	}
 	if err != nil {
-		return "", err
+		return OffsetRecord{}, err
 	}
-	var saved savedOffset
-	if err := json.Unmarshal(data, &saved); err != nil {
-		return "", fmt.Errorf("reading offset file %s: %w", s.path, err)
+	var record OffsetRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return OffsetRecord{}, fmt.Errorf("reading offset file %s: %w", s.path, err)
 	}
-	if saved.GTIDSet == "" && saved.File != "" {
-		return "", ErrLegacyOffset
-	}
-	return saved.GTIDSet, nil
-}
-
-func (s *FileOffsetStore) Clear() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := os.Remove(s.path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	return record, nil
 }

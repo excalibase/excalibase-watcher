@@ -42,14 +42,14 @@ func resolveStart(saved string, executed, purged gomysql.GTIDSet) (start gomysql
 	}
 	if !executed.Contain(set) {
 		return nil, false, fmt.Errorf("%w: saved %s, server executed %s; "+
-			"wait for the replica to catch up, or set mysql.reset_offset (WATCHER_MYSQL_RESET_OFFSET=true) "+
+			"wait for the replica to catch up, or set mysql.reset_offset (WATCHER_MYSQL_RESET_OFFSET) to a new token "+
 			"if this is a different database", ErrOffsetAheadOfServer, set, executed)
 	}
 	if !set.Contain(purged) {
 		return nil, false, fmt.Errorf("%w: saved %s, server purged %s; the changes in between are gone. "+
 			"To start over from the server's current position set mysql.reset_offset "+
-			"(WATCHER_MYSQL_RESET_OFFSET=true) for one start and re-snapshot the table data downstream "+
-			"(mysql.snapshot_mode=backup_file with a fresh dump); then unset it", ErrGTIDPurged, set, purged)
+			"(WATCHER_MYSQL_RESET_OFFSET=<any new token>, used once) and re-snapshot the table data downstream "+
+			"(mysql.snapshot_mode=backup_file with a fresh dump)", ErrGTIDPurged, set, purged)
 	}
 	return set, false, nil
 }

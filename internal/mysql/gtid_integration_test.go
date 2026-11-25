@@ -175,7 +175,7 @@ func TestFirstStartDoesNotReplayHistory(t *testing.T) {
 	defer stop()
 	insertRows(t, addr, "new", 1)
 	expectNames(t, names, "new-1")
-	if saved, _ := NewFileOffsetStore(cfg.OffsetFile).Load(); saved == "" {
+	if saved, _ := NewFileOffsetStore(cfg.OffsetFile).Load(); saved.GTIDSet == "" {
 		t.Error("the first start saved no offset")
 	}
 }
@@ -201,14 +201,14 @@ func TestPurgedOffsetFailsLoudlyAndResetOffsetIsTheWayOut(t *testing.T) {
 	if _, _, err := streamUsers(t, cfg); !errors.Is(err, ErrGTIDPurged) {
 		t.Fatalf("Start err = %v, want ErrGTIDPurged", err)
 	}
-	if kept, _ := NewFileOffsetStore(cfg.OffsetFile).Load(); kept == "" {
+	if kept, _ := NewFileOffsetStore(cfg.OffsetFile).Load(); kept.GTIDSet == "" {
 		t.Error("a refused start must keep the saved offset, so the operator still sees what was lost")
 	}
 
-	cfg.ResetOffset = true
+	cfg.ResetOffset = "after-purge"
 	names, stop, err = streamUsers(t, cfg)
 	if err != nil {
-		t.Fatalf("Start with reset_offset: %v", err)
+		t.Fatalf("Start with the reset token: %v", err)
 	}
 	defer stop()
 	insertRows(t, addr, "fresh", 1)
@@ -221,7 +221,7 @@ func TestOffsetOfAnotherServerIsRefused(t *testing.T) {
 	defer cleanup()
 	cfg := makeMySQLConfig(addr)
 	cfg.OffsetFile = filepath.Join(t.TempDir(), "o.json")
-	if err := NewFileOffsetStore(cfg.OffsetFile).Save(serverB + ":1-50"); err != nil {
+	if err := NewFileOffsetStore(cfg.OffsetFile).Save(OffsetRecord{GTIDSet: serverB + ":1-50"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := streamUsers(t, cfg); !errors.Is(err, ErrOffsetAheadOfServer) {
@@ -296,37 +296,53 @@ func TestKVOffsetStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	a, err := NewKVOffsetStore(ctx, js, "OFFSETS", "cdc.a.shop")
+	// Three replicas on a one-node NATS: the bucket falls back to one.
+	a, err := NewKVOffsetStore(ctx, js, "OFFSETS", "cdc.a.shop", 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := a.Load(); err != nil || got != "" {
-		t.Fatalf("empty Load = %q, %v", got, err)
+	if got, err := a.Load(); err != nil || got != (OffsetRecord{}) {
+		t.Fatalf("empty Load = %+v, %v", got, err)
 	}
-	set := fmt.Sprintf("%s:1-5", serverA)
-	if err := a.Save(set); err != nil {
+	want := OffsetRecord{GTIDSet: fmt.Sprintf("%s:1-5", serverA), ResetToken: "t1"}
+	if err := a.Save(want); err != nil {
 		t.Fatal(err)
 	}
-	// A second watcher opening the same bucket, and one with its own key.
-	again, err := NewKVOffsetStore(ctx, js, "OFFSETS", "cdc.a.shop")
+	again, err := NewKVOffsetStore(ctx, js, "OFFSETS", "cdc.a.shop", 3)
 	if err != nil {
 		t.Fatalf("opening an existing bucket: %v", err)
 	}
-	other, _ := NewKVOffsetStore(ctx, js, "OFFSETS", "cdc.b.shop")
-	if got, _ := again.Load(); got != set {
-		t.Errorf("same key Load = %q, want %q", got, set)
+	other, _ := NewKVOffsetStore(ctx, js, "OFFSETS", "cdc.b.shop", 3)
+	if got, _ := again.Load(); got != want {
+		t.Errorf("same key Load = %+v, want %+v", got, want)
 	}
-	if got, _ := other.Load(); got != "" {
-		t.Errorf("another watcher's key sees %q", got)
+	if got, _ := other.Load(); got != (OffsetRecord{}) {
+		t.Errorf("another watcher's key sees %+v", got)
 	}
-	if err := a.Clear(); err != nil {
+}
+
+// A purged key after a previous run is refused, not read as a first start.
+func TestKVOffsetLostKeyIsRefused(t *testing.T) {
+	env := natstest.Start(t)
+	conn := env.Connect(t)
+	js, err := jetstream.New(conn)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := again.Load(); got != "" {
-		t.Errorf("Load after Clear = %q", got)
+	ctx := context.Background()
+	store, err := NewKVOffsetStore(ctx, js, "OFFSETS", "cdc.proj.shop", 1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := a.Clear(); err != nil {
-		t.Errorf("clearing an absent key: %v", err)
+	mustDo(t, store.Save(OffsetRecord{GTIDSet: serverA + ":1-5"}))
+	kv, err := js.KeyValue(ctx, "OFFSETS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustDo(t, kv.Purge(ctx, "cdc.proj.shop"))
+
+	if _, err := store.Load(); !errors.Is(err, ErrOffsetLost) {
+		t.Fatalf("Load = %v, want ErrOffsetLost", err)
 	}
 }
 
@@ -337,12 +353,12 @@ func TestKVOffsetSurvivesANATSRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewKVOffsetStore(context.Background(), js, "OFFSETS", "cdc.proj.shop")
+	store, err := NewKVOffsetStore(context.Background(), js, "OFFSETS", "cdc.proj.shop", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	set := serverA + ":1-9"
-	if err := store.Save(set); err != nil {
+	want := OffsetRecord{GTIDSet: serverA + ":1-9"}
+	if err := store.Save(want); err != nil {
 		t.Fatal(err)
 	}
 	env.Stop()
@@ -352,11 +368,88 @@ func TestKVOffsetSurvivesANATSRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := NewKVOffsetStore(context.Background(), js, "OFFSETS", "cdc.proj.shop")
+	reopened, err := NewKVOffsetStore(context.Background(), js, "OFFSETS", "cdc.proj.shop", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := reopened.Load(); err != nil || got != set {
-		t.Fatalf("after restart Load = %q, %v; want %q", got, err, set)
+	if got, err := reopened.Load(); err != nil || got != want {
+		t.Fatalf("after restart Load = %+v, %v; want %+v", got, err, want)
 	}
+}
+
+// Streaming that breaks after Start reaches the watcher through Failed(), which
+// makes it exit instead of idling. The break here is the server leaving GTID
+// mode ON under the running stream: it refuses the re-sync, and an anonymous
+// transaction follows. (The anonymous event itself is refused in the handler,
+// see TestAnonymousGTIDStopsTheWatcher.)
+func TestStreamBreakingAfterStartIsReportedAsAFailure(t *testing.T) {
+	addr, _, cleanup := setupMySQL(t)
+	defer cleanup()
+	cfg := makeMySQLConfig(addr)
+	cfg.OffsetFile = filepath.Join(t.TempDir(), "o.json")
+	cfg.Tables = []string{"cdc_test_users"}
+
+	svc := cdc.NewService()
+	defer svc.Shutdown()
+	listener, err := NewListener(cfg, svc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer listener.Stop()
+
+	execMySQL(t, addr, "SET GLOBAL gtid_mode=ON_PERMISSIVE")
+	db := openTestDB(t, addr, 5, time.Second)
+	defer db.Close()
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, statement := range []string{
+		"SET gtid_next='ANONYMOUS'",
+		"INSERT INTO cdc_test_users (name) VALUES ('anonymous')",
+		"SET gtid_next='AUTOMATIC'",
+	} {
+		if _, err := conn.ExecContext(context.Background(), statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+
+	select {
+	case err := <-listener.Failed():
+		if err == nil {
+			t.Fatal("failure delivered without an error")
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("a broken stream was never reported")
+	}
+}
+
+// The reset token applies once: restarting with it still set keeps the offset
+// the first start went on to save.
+func TestResetTokenIsOneShotAcrossRestarts(t *testing.T) {
+	addr, _, cleanup := setupMySQL(t)
+	defer cleanup()
+	cfg := makeMySQLConfig(addr)
+	cfg.OffsetFile = filepath.Join(t.TempDir(), "o.json")
+	cfg.ResetOffset = "t1"
+
+	names, stop, err := streamUsers(t, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertRows(t, addr, "one", 1)
+	expectNames(t, names, "one-1")
+	stop()
+
+	insertRows(t, addr, "while-down", 1)
+	names, stop, err = streamUsers(t, cfg) // same token, still set in the environment
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	expectNames(t, names, "while-down-1")
 }

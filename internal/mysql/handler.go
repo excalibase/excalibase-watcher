@@ -1,6 +1,7 @@
 package mysql
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -36,6 +37,15 @@ type eventHandler struct {
 // id would be both unique and stable on replay.
 var errUnplacedRow = errors.New("mysql event has no enclosing GTID transaction; " +
 	"refusing to publish it under an id that could collide (is gtid_mode ON?)")
+
+// errAnonymousGTID is a transaction with no GTID. Its events would all share
+// one id, and JetStream would silently drop every row after the first.
+var errAnonymousGTID = errors.New("mysql transaction has an anonymous GTID (gtid_mode is not ON, or gtid_next was set to ANONYMOUS); " +
+	"refusing to publish it under an id that would collide with others")
+
+// errTaggedGTID is a MySQL 8.4 tagged GTID, which the offset and ids here do
+// not represent.
+var errTaggedGTID = errors.New("mysql transaction has a tagged GTID, which this watcher does not support")
 
 // emit passes an event to the bus and counts it toward the commit gate when
 // it will be published.
@@ -88,6 +98,9 @@ func (h *eventHandler) emitRows(e *canal.RowsEvent, kind cdc.EventType, op strin
 // (one canal reports no DDL or XID for) is closed here, since the next one
 // can only begin after it committed.
 func (h *eventHandler) OnGTID(_ *replication.EventHeader, event gomysql.BinlogGTIDEvent) error {
+	if err := refuseUnsupportedGTID(event); err != nil {
+		return err
+	}
 	if err := h.foldOpen(); err != nil {
 		return err
 	}
@@ -95,7 +108,22 @@ func (h *eventHandler) OnGTID(_ *replication.EventHeader, event gomysql.BinlogGT
 	if err != nil {
 		return fmt.Errorf("reading the transaction's GTID: %w", err)
 	}
+	if next.String() == "" {
+		return errAnonymousGTID
+	}
 	h.open, h.events = next, 0
+	return nil
+}
+
+func refuseUnsupportedGTID(event gomysql.BinlogGTIDEvent) error {
+	switch e := event.(type) {
+	case *replication.GtidTaggedLogEvent:
+		return errTaggedGTID
+	case *replication.GTIDEvent:
+		if e.GNO <= 0 || bytes.Equal(e.SID, make([]byte, len(e.SID))) {
+			return errAnonymousGTID
+		}
+	}
 	return nil
 }
 
@@ -123,6 +151,7 @@ func (h *eventHandler) closeTransaction() error {
 		return err
 	}
 	h.gate.Committed(h.executed.String())
+	h.open, h.events = nil, 0
 	return nil
 }
 

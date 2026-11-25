@@ -53,7 +53,8 @@ data:
       offset_file: {{ .Values.mysql.offsetFile | quote }}
       {{- end }}
       offset_bucket: {{ .Values.mysql.offsetBucket | quote }}
-      reset_offset: {{ .Values.mysql.resetOffset }}
+      offset_replicas: {{ .Values.mysql.offsetReplicas }}
+      reset_offset: {{ .Values.mysql.resetOffset | quote }}
 
     nats:
       enabled: {{ .Values.nats.enabled }}

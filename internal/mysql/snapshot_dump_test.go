@@ -127,3 +127,21 @@ func TestParseMysqlDumpSingleLineGTIDSet(t *testing.T) {
 		t.Errorf("gtid set = %q", set)
 	}
 }
+
+// Only mysqldump's own statement names the dump's GTID set; the same words in
+// a comment or inside a row must not become the offset.
+func TestParseMysqlDumpIgnoresGTIDPurgedOutsideItsStatement(t *testing.T) {
+	dump := "-- note: GTID_PURGED='3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9' was applied\n" +
+		"-- SET @@GLOBAL.GTID_PURGED='4f22fb58-82db-22f2-af44-d91bb0530673:1-2';\n"
+	dumpFile := filepath.Join(t.TempDir(), "dump.sql")
+	if err := os.WriteFile(dumpFile, []byte(dump), 0644); err != nil {
+		t.Fatal(err)
+	}
+	set, err := ParseMysqlDumpFile(dumpFile, "mydb", func(cdc.Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set != "" {
+		t.Errorf("gtid set = %q, want none", set)
+	}
+}

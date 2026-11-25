@@ -126,10 +126,16 @@ mysql:
   offsetFile: ""
   offsetBucket: "WATCHER_MYSQL_OFFSETS"
 
-  # Discard the saved offset for one start and stream from the server's current
-  # position. The way out of a purged offset (the watcher fails with a clear
-  # error); unset it again after that start.
-  resetOffset: false
+  # Replicas of the offset bucket in NATS (1 to 5). A cluster with fewer
+  # servers gets one replica and the watcher logs a warning: the offset is then
+  # lost with that server.
+  offsetReplicas: 3
+
+  # A token. A start that sees one it has not used yet discards the saved offset
+  # and streams from the server's current position: the way out of a purged,
+  # lost or foreign offset. The token is stored with the offset, so leaving it
+  # set does not reset again; change it to reset again.
+  resetOffset: ""
 
   # Persistent volume for the offset file (only with offsetFile)
   persistence:

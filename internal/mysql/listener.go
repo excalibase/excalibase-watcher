@@ -31,6 +31,7 @@ type Listener struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	gate        *commitGate
+	record      OffsetRecord
 	savedOffset string
 	failed      chan error
 }
@@ -78,8 +79,8 @@ func (l *Listener) Start(ctx context.Context) error {
 	}
 	ctx, l.cancel = context.WithCancel(ctx)
 
-	// Checked before the snapshot, so nothing is published from a server
-	// the watcher will not connect to.
+	// Only the TLS setup can fail here; the server itself is checked once
+	// connected, before the snapshot publishes anything.
 	canalConfig, err := l.buildCanalConfig()
 	if err != nil {
 		return err
@@ -87,12 +88,8 @@ func (l *Listener) Start(ctx context.Context) error {
 	if l.offsetStore == nil {
 		slog.Warn("mysql: no offset store; every restart resumes from the server's current position and loses what happened meanwhile")
 	}
-	if err := l.resetOffsetIfAsked(); err != nil {
+	if err := l.loadOffset(); err != nil {
 		return err
-	}
-
-	if err := l.runSnapshot(); err != nil {
-		return fmt.Errorf("snapshot: %w", err)
 	}
 
 	c, err := canal.NewCanal(canalConfig)
@@ -104,6 +101,10 @@ func (l *Listener) Start(ctx context.Context) error {
 	if err := verifyServer(c, l.cfg.Schema, l.cfg.Tables); err != nil {
 		c.Close()
 		return err
+	}
+	if err := l.runSnapshot(); err != nil {
+		c.Close()
+		return fmt.Errorf("snapshot: %w", err)
 	}
 	startSet, err := l.resolveStartSet(c)
 	if err != nil {
@@ -179,14 +180,42 @@ func (l *Listener) buildCanalConfig() (*canal.Config, error) {
 	return cfg, nil
 }
 
-// resetOffsetIfAsked drops the saved offset when the operator set
-// mysql.reset_offset: the way out of a purged or foreign offset.
-func (l *Listener) resetOffsetIfAsked() error {
-	if !l.cfg.ResetOffset || l.offsetStore == nil {
+// loadOffset reads the saved offset and applies mysql.reset_offset: a token
+// not used before discards the offset, and is saved so it is used only once.
+func (l *Listener) loadOffset() error {
+	if l.offsetStore == nil {
 		return nil
 	}
-	slog.Warn("mysql.reset_offset is set: discarding the saved offset, streaming from the server's current position")
-	return l.offsetStore.Clear()
+	saved, err := l.offsetStore.Load()
+	lost := errors.Is(err, ErrOffsetLost)
+	if err != nil && !(lost && l.cfg.ResetOffset != "") {
+		return fmt.Errorf("loading saved offset: %w", err)
+	}
+	record, reset := applyResetToken(saved, l.cfg.ResetOffset)
+	if reset {
+		slog.Warn("mysql.reset_offset: discarding the saved offset, streaming from the server's current position",
+			"token", l.cfg.ResetOffset)
+		if err := l.offsetStore.Save(record); err != nil {
+			return fmt.Errorf("saving the reset token: %w", err)
+		}
+	}
+	if err := record.usable(); err != nil {
+		return err
+	}
+	l.record = record
+	return nil
+}
+
+// saveOffset persists a new GTID set together with the reset token already used.
+func (l *Listener) saveOffset(gtidSet string) error {
+	next := l.record
+	next.GTIDSet = gtidSet
+	if err := l.offsetStore.Save(next); err != nil {
+		return err
+	}
+	l.record = next
+	l.savedOffset = gtidSet
+	return nil
 }
 
 // resolveStartSet returns the GTID set to stream from. On first start that is
@@ -194,18 +223,11 @@ func (l *Listener) resetOffsetIfAsked() error {
 // would flood the pipeline; the set is saved at once so a restart before the
 // first transaction still resumes from the same place.
 func (l *Listener) resolveStartSet(c *canal.Canal) (gomysql.GTIDSet, error) {
-	var saved string
-	if l.offsetStore != nil {
-		var err error
-		if saved, err = l.offsetStore.Load(); err != nil {
-			return nil, fmt.Errorf("loading saved offset: %w", err)
-		}
-	}
 	executed, purged, err := serverGTIDSets(c)
 	if err != nil {
 		return nil, err
 	}
-	start, fresh, err := resolveStart(saved, executed, purged)
+	start, fresh, err := resolveStart(l.record.GTIDSet, executed, purged)
 	if err != nil {
 		return nil, err
 	}
@@ -215,10 +237,9 @@ func (l *Listener) resolveStartSet(c *canal.Canal) (gomysql.GTIDSet, error) {
 	}
 	slog.Info("no saved offset, starting from the server's executed GTID set", "gtid_set", start.String())
 	if l.offsetStore != nil && start.String() != "" {
-		if err := l.offsetStore.Save(start.String()); err != nil {
+		if err := l.saveOffset(start.String()); err != nil {
 			return nil, fmt.Errorf("saving initial offset: %w", err)
 		}
-		l.savedOffset = start.String()
 	}
 	return start, nil
 }
@@ -269,11 +290,7 @@ func (l *Listener) saveConfirmedOffset() error {
 	if !ok || gtidSet == l.savedOffset {
 		return nil
 	}
-	if err := l.offsetStore.Save(gtidSet); err != nil {
-		return err
-	}
-	l.savedOffset = gtidSet
-	return nil
+	return l.saveOffset(gtidSet)
 }
 
 func (l *Listener) IsRunning() bool {
@@ -293,7 +310,7 @@ func (l *Listener) runSnapshot() error {
 			return err
 		}
 		if l.offsetStore != nil && gtidSet != "" {
-			return l.offsetStore.Save(gtidSet)
+			return l.saveOffset(gtidSet)
 		}
 		return nil
 	default:

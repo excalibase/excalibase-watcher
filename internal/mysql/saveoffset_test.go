@@ -22,11 +22,11 @@ func newGatedListener(t *testing.T, executed string) (*Listener, *eventHandler, 
 
 func loadOffset(t *testing.T, path string) string {
 	t.Helper()
-	set, err := NewFileOffsetStore(path).Load()
+	record, err := NewFileOffsetStore(path).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	return set
+	return record.GTIDSet
 }
 
 func TestSaveConfirmedOffsetWithNothingConfirmedWritesNothing(t *testing.T) {
