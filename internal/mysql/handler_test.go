@@ -3,6 +3,7 @@ package mysql
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/excalibase/watcher-go/internal/cdc"
@@ -210,5 +211,11 @@ func TestDDLAfterACommitHasNoTransaction(t *testing.T) {
 	err := h.OnDDL(nil, gomysql.Position{}, &replication.QueryEvent{Query: []byte("DROP TABLE t")})
 	if !errors.Is(err, errUnplacedRow) {
 		t.Fatalf("err = %v, want errUnplacedRow", err)
+	}
+}
+
+func TestAnUnplacedRowNamesTaggedGTIDsAsACause(t *testing.T) {
+	if !strings.Contains(errUnplacedRow.Error(), "tagged") {
+		t.Fatalf("message %q does not mention tagged GTIDs", errUnplacedRow)
 	}
 }

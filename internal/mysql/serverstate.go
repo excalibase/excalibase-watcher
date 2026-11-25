@@ -50,19 +50,27 @@ func readSettings(c *canal.Canal) (serverSettings, error) {
 // serverGTIDSets returns the transactions the server has executed and the
 // ones whose binlogs it has purged.
 func serverGTIDSets(c *canal.Canal) (executed, purged gomysql.GTIDSet, err error) {
-	if executed, err = c.GetMasterGTIDSet(); err != nil {
-		return nil, nil, fmt.Errorf("reading the server's executed GTID set: %w", err)
+	if executed, err = queryGTIDSet(c, "executed"); err != nil {
+		return nil, nil, err
 	}
-	result, err := c.Execute("SELECT @@GLOBAL.gtid_purged")
+	if purged, err = queryGTIDSet(c, "purged"); err != nil {
+		return nil, nil, err
+	}
+	return executed, purged, nil
+}
+
+func queryGTIDSet(c *canal.Canal, which string) (gomysql.GTIDSet, error) {
+	result, err := c.Execute("SELECT @@GLOBAL.gtid_" + which)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading the server's purged GTID set: %w", err)
+		return nil, fmt.Errorf("reading the server's %s GTID set: %w", which, err)
 	}
 	text, err := result.GetString(0, 0)
 	if err != nil {
-		return nil, nil, fmt.Errorf("reading the server's purged GTID set: %w", err)
+		return nil, fmt.Errorf("reading the server's %s GTID set: %w", which, err)
 	}
-	if purged, err = parseGTIDSet(text); err != nil {
-		return nil, nil, fmt.Errorf("parsing the server's purged GTID set %q: %w", text, err)
+	set, err := parseServerGTIDSet(text)
+	if err != nil {
+		return nil, fmt.Errorf("parsing the server's %s GTID set: %w", which, err)
 	}
-	return executed, purged, nil
+	return set, nil
 }

@@ -187,8 +187,9 @@ func (l *Listener) loadOffset() error {
 		return nil
 	}
 	saved, err := l.offsetStore.Load()
-	lost := errors.Is(err, ErrOffsetLost)
-	if err != nil && !(lost && l.cfg.ResetOffset != "") {
+	// A lost offset comes back with the token the marker holds; only a token
+	// different from it may wave the loss through.
+	if err != nil && !(errors.Is(err, ErrOffsetLost) && l.cfg.ResetOffset != "" && l.cfg.ResetOffset != saved.ResetToken) {
 		return fmt.Errorf("loading saved offset: %w", err)
 	}
 	record, reset := applyResetToken(saved, l.cfg.ResetOffset)

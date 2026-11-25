@@ -3,6 +3,7 @@ package mysql
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
@@ -23,6 +24,22 @@ var (
 // breaks between the uuids.
 func parseGTIDSet(s string) (gomysql.GTIDSet, error) {
 	return gomysql.ParseMysqlGTIDSet(strings.Join(strings.Fields(s), ""))
+}
+
+var gtidInterval = regexp.MustCompile(`^\d+(-\d+)?$`)
+
+// parseServerGTIDSet reads a set the server reports. A tag (MySQL 8.4's
+// uuid:tag:1-5) is refused: the offset and message ids here cannot represent it.
+func parseServerGTIDSet(s string) (gomysql.GTIDSet, error) {
+	compact := strings.Join(strings.Fields(s), "")
+	for _, element := range strings.Split(compact, ",") {
+		for _, part := range strings.Split(element, ":")[1:] {
+			if !gtidInterval.MatchString(part) {
+				return nil, fmt.Errorf("%w: %q", errTaggedGTID, element)
+			}
+		}
+	}
+	return gomysql.ParseMysqlGTIDSet(compact)
 }
 
 // resolveStart picks the GTID set to stream from. The saved set is the set of

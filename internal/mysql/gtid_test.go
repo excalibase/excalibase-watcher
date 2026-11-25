@@ -86,3 +86,20 @@ func TestParseGTIDSetToleratesTheServersLineBreaks(t *testing.T) {
 		t.Fatalf("set = %v", set)
 	}
 }
+
+func TestTaggedGTIDSetsAreRefusedAtStart(t *testing.T) {
+	for _, set := range []string{
+		serverA + ":blue:1-5",
+		serverA + ":1-3," + serverB + ":red:7",
+		serverA + ":1-3:blue:5-9",
+	} {
+		if _, err := parseServerGTIDSet(set); !errors.Is(err, errTaggedGTID) {
+			t.Errorf("%q: err = %v, want errTaggedGTID", set, err)
+		}
+	}
+	for _, set := range []string{"", serverA + ":1-5", serverA + ":1-3:7-9,\n" + serverB + ":4"} {
+		if _, err := parseServerGTIDSet(set); err != nil {
+			t.Errorf("%q: %v", set, err)
+		}
+	}
+}

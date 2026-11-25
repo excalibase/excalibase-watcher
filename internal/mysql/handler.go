@@ -36,7 +36,7 @@ type eventHandler struct {
 // errUnplacedRow means an event arrived outside any transaction, so no message
 // id would be both unique and stable on replay.
 var errUnplacedRow = errors.New("mysql event has no enclosing GTID transaction; " +
-	"refusing to publish it under an id that could collide (is gtid_mode ON?)")
+	"refusing to publish it under an id that could collide (is gtid_mode ON, or is this a tagged GTID?)")
 
 // errAnonymousGTID is a transaction with no GTID. Its events would all share
 // one id, and JetStream would silently drop every row after the first.

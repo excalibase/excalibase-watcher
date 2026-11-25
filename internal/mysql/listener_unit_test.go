@@ -154,11 +154,12 @@ func TestStopAndCleanEndsAreNotFailures(t *testing.T) {
 }
 
 type scriptedStore struct {
+	loaded  OffsetRecord
 	loadErr error
 	saved   []OffsetRecord
 }
 
-func (s *scriptedStore) Load() (OffsetRecord, error) { return OffsetRecord{}, s.loadErr }
+func (s *scriptedStore) Load() (OffsetRecord, error) { return s.loaded, s.loadErr }
 func (s *scriptedStore) Save(r OffsetRecord) error   { s.saved = append(s.saved, r); return nil }
 
 // A lost offset stops the watcher; the reset token is the explicit way past it.
@@ -175,5 +176,35 @@ func TestLostOffsetNeedsTheResetToken(t *testing.T) {
 	mustDo(t, l.loadOffset())
 	if len(store.saved) != 1 || store.saved[0].ResetToken != "t1" {
 		t.Fatalf("the token was not saved: %+v", store.saved)
+	}
+}
+
+// The marker remembers the last token used. A token still set from an earlier
+// reset must not wave a lost offset through; only a different one may.
+func TestLostOffsetWithAStaleTokenStaysRefused(t *testing.T) {
+	store := &scriptedStore{loaded: OffsetRecord{ResetToken: "t1"}, loadErr: ErrOffsetLost}
+	l, _ := NewListener(config.MySQLConfig{ResetOffset: "t1"}, cdc.NewService())
+	l.SetOffsetStore(store)
+	if err := l.loadOffset(); !errors.Is(err, ErrOffsetLost) {
+		t.Fatalf("err = %v, want ErrOffsetLost", err)
+	}
+	if len(store.saved) != 0 {
+		t.Fatalf("a refused start saved %+v", store.saved)
+	}
+
+	l, _ = NewListener(config.MySQLConfig{ResetOffset: "t2"}, cdc.NewService())
+	l.SetOffsetStore(store)
+	mustDo(t, l.loadOffset())
+	if len(store.saved) != 1 || store.saved[0].ResetToken != "t2" || store.saved[0].GTIDSet != "" {
+		t.Fatalf("a new token did not reset: %+v", store.saved)
+	}
+}
+
+func TestLostOffsetWithNoTokenIsRefusedWhateverTheMarkerHolds(t *testing.T) {
+	store := &scriptedStore{loaded: OffsetRecord{ResetToken: "t1"}, loadErr: ErrOffsetLost}
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	l.SetOffsetStore(store)
+	if err := l.loadOffset(); !errors.Is(err, ErrOffsetLost) {
+		t.Fatalf("err = %v, want ErrOffsetLost", err)
 	}
 }
