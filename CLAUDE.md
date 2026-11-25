@@ -32,7 +32,7 @@ Code: `internal/nats/publisher.go::ensureStream`.
 ### 2. **Offset save follows NATS ack, NOT canal's XID position.**
 Canal's `OnXID` used to save the binlog offset after each transaction. But `HandleEvent` is non-blocking on the channel — events can be buffered (100k) and not yet published when canal moves past them. A crash between "offset saved" and "publisher acked" = data loss.
 
-Now: the MySQL `commitGate` counts every publishable event handed to the bus and every one JetStream acked (`Publisher.AddOnPublished`). It only confirms transaction boundaries (after XID, DDL, rotate), and only once every event handed before the boundary is acked. The `offsetSaver` goroutine persists the confirmed boundary every 1 s. Never persist a rows event's position: all rows of a multi-row event share it, so a crash after some rows were acked would resume after the rest (EXC-509). Crash = the unconfirmed transactions replay whole; rows already published carry the same source id (`mysql:file:pos:row`) and the stream drops them as duplicates. At-least-once holds.
+Now: the MySQL `commitGate` counts every publishable event handed to the bus and every one JetStream acked (`Publisher.AddOnPublished`). It only confirms transaction boundaries (after XID, DDL), and only once every event handed before the boundary is acked. The `offsetSaver` goroutine persists the confirmed boundary every 1 s. The offset is a GTID set (EXC-828), never a file and position: a position means nothing on another replica after a MOCO failover. Crash = the unconfirmed transactions replay whole; rows already published carry the same source id (`mysql:<gtid>:<row index in the transaction>`, identical on every replica) and the stream drops them as duplicates, but only within the stream's duplicate window (2 minutes by default): delivery is at-least-once, so consumers dedupe on the id. The set is kept in a JetStream KV bucket (or a file with a PVC) with a marker key, so a lost offset key fails the start instead of skipping changes (losing the whole bucket, or using the file store, has no such protection); `mysql.reset_offset` is a one-shot token stored beside the offset. Anonymous and tagged GTIDs stop the watcher. At-least-once holds.
 
 Code: `internal/mysql/ackgate.go`, `internal/mysql/listener.go::offsetSaver`.
 
@@ -43,10 +43,10 @@ Buffer size: 100k events (was 10k). For realistic CDC throughput (100–1000 evt
 
 Code: `internal/cdc/service.go::deliver`.
 
-### 4. **Canal starts at current master position, never position 0.**
-`canal.Run()` with `Dump.ExecutionPath=""` (which we want — we don't want canal's built-in `mysqldump` to block startup) starts at binlog position **0 of the oldest file** — i.e. it replays everything. We call `c.GetMasterPos()` first and use `RunFrom(pos)` explicitly. The returned position is also saved to the offset store so restart stays consistent.
+### 4. **Canal starts at the server's executed GTID set on first start, never the start of the binlog.**
+`canal.Run()` with `Dump.ExecutionPath=""` (which we want — we don't want canal's built-in `mysqldump` to block startup) starts at binlog position **0 of the oldest file** — i.e. it replays everything. We resolve the start GTID set first (`resolveStart`: saved set, or the server's `gtid_executed` on first start; refused when the saved set was purged or is ahead of the server) and use `StartFromGTID`. The set is saved at once so restart stays consistent. Start-up also checks `binlog_format`, `binlog_row_image`, `gtid_mode`, `enforce_gtid_consistency` and the login's grants (`servercheck.go`).
 
-Code: `internal/mysql/listener.go::Start` (look for `GetMasterPos`).
+Code: `internal/mysql/gtid.go`, `listener.go::Start`.
 
 ### 5. **Never trust the Dockerfile base to keep CGO off.**
 The go-mysql library compiles with `CGO_ENABLED=0`. Verify this in CI — if anyone adds a CGO dependency later, the distroless/static image breaks.

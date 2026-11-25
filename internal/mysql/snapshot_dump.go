@@ -5,39 +5,49 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/jsonutil"
 )
 
-// CHANGE MASTER TO MASTER_LOG_FILE='mysql-bin.000003', MASTER_LOG_POS=154;
-var binlogPosRegex = regexp.MustCompile(`MASTER_LOG_FILE='([^']+)',\s*MASTER_LOG_POS=(\d+)`)
+// SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ 'uuid:1-5,\nuuid2:1-3';
+// mysqldump writes the set the dump already contains, which is where the
+// binlog stream must pick up. A long set runs over several lines.
+var (
+	gtidPurgedStart = regexp.MustCompile(`^\s*SET\s+@@(?:GLOBAL\.)?GTID_PURGED\s*=\s*(?:/\*!\d+ '\+'\*/\s*)?'([^']*)('?)`)
+)
 
 // INSERT INTO `table` VALUES (...),(...);
 var insertRegex = regexp.MustCompile("^INSERT INTO `([^`]+)` VALUES ")
 
-func ParseMysqlDumpFile(filePath, schema string, handler func(cdc.Event)) (BinlogPosition, error) {
+// ParseMysqlDumpFile replays the dump's rows to handler and returns the dump's
+// GTID set, empty when the dump carries none.
+func ParseMysqlDumpFile(filePath, schema string, handler func(cdc.Event)) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		return BinlogPosition{}, fmt.Errorf("opening dump file: %w", err)
+		return "", fmt.Errorf("opening dump file: %w", err)
 	}
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1024*1024), 50*1024*1024) // 50MB max line
 
-	var pos BinlogPosition
+	var gtidSet strings.Builder
+	inGTIDSet := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Extract binlog position from CHANGE MASTER TO comment
-		if matches := binlogPosRegex.FindStringSubmatch(line); matches != nil {
-			pos.File = matches[1]
-			p, _ := strconv.ParseUint(matches[2], 10, 32)
-			pos.Position = uint32(p)
+		if inGTIDSet {
+			text, closed := strings.CutSuffix(strings.TrimSuffix(strings.TrimSpace(line), ";"), "'")
+			gtidSet.WriteString(strings.TrimSpace(text))
+			inGTIDSet = !closed
+			continue
+		}
+		if matches := gtidPurgedStart.FindStringSubmatch(line); matches != nil {
+			gtidSet.WriteString(strings.TrimSpace(matches[1]))
+			inGTIDSet = matches[2] == ""
 			continue
 		}
 
@@ -54,7 +64,7 @@ func ParseMysqlDumpFile(filePath, schema string, handler func(cdc.Event)) (Binlo
 		}
 	}
 
-	return pos, scanner.Err()
+	return gtidSet.String(), scanner.Err()
 }
 
 // parseValuesList parses "(v1,v2,...),(v1,v2,...)" from a mysqldump INSERT.
@@ -128,4 +138,3 @@ func tupleToJSON(values []string) string {
 	sb.WriteByte('}')
 	return sb.String()
 }
-

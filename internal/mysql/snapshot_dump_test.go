@@ -12,6 +12,8 @@ func TestParseMysqlDumpFile(t *testing.T) {
 	dump := `-- MySQL dump 10.13  Distrib 8.0.36
 --
 -- CHANGE MASTER TO MASTER_LOG_FILE='mysql-bin.000003', MASTER_LOG_POS=154;
+SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ '3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5,
+4f22fb58-82db-22f2-af44-d91bb0530673:1-2';
 
 INSERT INTO ` + "`users`" + ` VALUES (1,'Alice','alice@test.com'),(2,'Bob',NULL);
 
@@ -31,12 +33,10 @@ INSERT INTO ` + "`orders`" + ` VALUES (10,1,99.99),(20,2,49.50);
 		t.Fatalf("ParseMysqlDumpFile error: %v", err)
 	}
 
-	// Should extract binlog position from CHANGE MASTER TO
-	if pos.File != "mysql-bin.000003" {
-		t.Errorf("binlog file = %q, want mysql-bin.000003", pos.File)
-	}
-	if pos.Position != 154 {
-		t.Errorf("binlog position = %d, want 154", pos.Position)
+	// The dump's GTID set, joined across the lines mysqldump breaks it over.
+	want := "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5,4f22fb58-82db-22f2-af44-d91bb0530673:1-2"
+	if pos != want {
+		t.Errorf("gtid set = %q, want %q", pos, want)
 	}
 
 	if len(events) != 4 {
@@ -105,10 +105,43 @@ func TestParseMysqlDumpNoBinlogPos(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error: %v", err)
 	}
-	if pos.File != "" {
-		t.Errorf("expected empty binlog file, got %q", pos.File)
+	if pos != "" {
+		t.Errorf("expected no GTID set, got %q", pos)
 	}
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+}
+
+func TestParseMysqlDumpSingleLineGTIDSet(t *testing.T) {
+	dump := "SET @@GLOBAL.GTID_PURGED='3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9';\n"
+	dumpFile := filepath.Join(t.TempDir(), "dump.sql")
+	if err := os.WriteFile(dumpFile, []byte(dump), 0644); err != nil {
+		t.Fatal(err)
+	}
+	set, err := ParseMysqlDumpFile(dumpFile, "mydb", func(cdc.Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set != "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9" {
+		t.Errorf("gtid set = %q", set)
+	}
+}
+
+// Only mysqldump's own statement names the dump's GTID set; the same words in
+// a comment or inside a row must not become the offset.
+func TestParseMysqlDumpIgnoresGTIDPurgedOutsideItsStatement(t *testing.T) {
+	dump := "-- note: GTID_PURGED='3e11fa47-71ca-11e1-9e33-c80aa9429562:1-9' was applied\n" +
+		"-- SET @@GLOBAL.GTID_PURGED='4f22fb58-82db-22f2-af44-d91bb0530673:1-2';\n"
+	dumpFile := filepath.Join(t.TempDir(), "dump.sql")
+	if err := os.WriteFile(dumpFile, []byte(dump), 0644); err != nil {
+		t.Fatal(err)
+	}
+	set, err := ParseMysqlDumpFile(dumpFile, "mydb", func(cdc.Event) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set != "" {
+		t.Errorf("gtid set = %q, want none", set)
 	}
 }

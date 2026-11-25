@@ -40,7 +40,10 @@ mysql:
   snapshot_mode: none
   snapshot_chunk_size: 10000
   snapshot_backup_file: ""
-  offset_file: ""                    # optional, persists binlog position
+  offset_file: ""                    # empty = resume offset (GTID set) lives in the NATS bucket below
+  offset_bucket: WATCHER_MYSQL_OFFSETS
+  offset_replicas: 3                 # replicas of the NATS offset bucket (1 to 5); fewer servers get 1 with a warning
+  reset_offset: ""                   # a token: an unused one discards the saved offset once (purged, lost or foreign offset)
 
 nats:
   enabled: true

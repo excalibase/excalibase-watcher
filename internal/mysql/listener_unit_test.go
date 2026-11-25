@@ -2,15 +2,12 @@ package mysql
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/config"
-	"github.com/go-mysql-org/go-mysql/canal"
-	gomysql "github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/go-mysql-org/go-mysql/replication"
-	"github.com/go-mysql-org/go-mysql/schema"
 )
 
 func TestNewListenerWithoutOffsetFile(t *testing.T) {
@@ -39,35 +36,6 @@ func TestNewListenerWithOffsetFile(t *testing.T) {
 	}
 }
 
-func TestGetStartPositionNoStore(t *testing.T) {
-	svc := cdc.NewService()
-	l, _ := NewListener(config.MySQLConfig{}, svc)
-	pos, err := l.getStartPosition()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pos != nil {
-		t.Errorf("expected nil pos, got %v", pos)
-	}
-}
-
-func TestGetStartPositionWithSavedOffset(t *testing.T) {
-	svc := cdc.NewService()
-	path := filepath.Join(t.TempDir(), "offset.json")
-	store := NewFileOffsetStore(path)
-	if err := store.Save(BinlogPosition{File: "mysql-bin.0005", Position: 9999}); err != nil {
-		t.Fatal(err)
-	}
-	l, _ := NewListener(config.MySQLConfig{OffsetFile: path}, svc)
-	pos, err := l.getStartPosition()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pos == nil || pos.File != "mysql-bin.0005" || pos.Position != 9999 {
-		t.Errorf("got %v", pos)
-	}
-}
-
 func TestRunSnapshotNoneMode(t *testing.T) {
 	svc := cdc.NewService()
 	l, _ := NewListener(config.MySQLConfig{SnapshotMode: ""}, svc)
@@ -88,57 +56,155 @@ func TestRunSnapshotBackupFileRequiresPath(t *testing.T) {
 	}
 }
 
-func TestEventHandlerCurrentBinlogFile(t *testing.T) {
-	h := &eventHandler{}
-	if got := h.currentBinlogFile(); got != "" {
-		t.Errorf("empty handler should return empty, got %q", got)
-	}
-	h.currentFile = "mysql-bin.000001"
-	if got := h.currentBinlogFile(); got != "mysql-bin.000001" {
-		t.Errorf("got %q", got)
-	}
-}
-
-// Every row of one binlog rows event shares its position, so the row index
-// makes each source id unique; replaying the binlog yields the same ids.
-func TestRowsGetPositionPlusRowIndexSourceIDs(t *testing.T) {
-	svc := cdc.NewService()
-	defer svc.Shutdown()
-	ch, unsub := svc.SubscribeAll()
-	defer unsub()
-	h := &eventHandler{service: svc, gate: newCommitGate(), currentFile: "mysql-bin.000003"}
-
-	rows := &canal.RowsEvent{
-		Table:  &schema.Table{Schema: "shop", Name: "orders", Columns: []schema.TableColumn{{Name: "id"}}},
-		Action: canal.InsertAction,
-		Rows:   [][]interface{}{{1}, {2}},
-		Header: &replication.EventHeader{LogPos: 4711},
-	}
-	for pass := 0; pass < 2; pass++ {
-		if err := h.OnRow(rows); err != nil {
-			t.Fatal(err)
-		}
-		for i, want := range []string{"mysql:mysql-bin.000003:4711:0", "mysql:mysql-bin.000003:4711:1"} {
-			if got := (<-ch).SourceID; got != want {
-				t.Errorf("pass %d row %d source id = %q, want %q", pass, i, got, want)
-			}
-		}
-	}
-}
-
-func TestDDLGetsAPositionSourceID(t *testing.T) {
-	svc := cdc.NewService()
-	defer svc.Shutdown()
-	ch, unsub := svc.SubscribeAll()
-	defer unsub()
-	h := &eventHandler{service: svc, gate: newCommitGate()}
-
-	err := h.OnDDL(nil, gomysql.Position{Name: "mysql-bin.000003", Pos: 900},
-		&replication.QueryEvent{Schema: []byte("shop"), Query: []byte("ALTER TABLE orders ADD c INT")})
+func newFileListener(t *testing.T, path, token string) *Listener {
+	t.Helper()
+	l, err := NewListener(config.MySQLConfig{OffsetFile: path, ResetOffset: token}, cdc.NewService())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := (<-ch).SourceID; got != "mysql:mysql-bin.000003:900:ddl" {
-		t.Errorf("DDL source id = %q", got)
+	return l
+}
+
+// The token discards the saved offset once; a restart with the token still set
+// must keep the offset the first start went on to save.
+func TestResetTokenDiscardsTheOffsetOnlyOnce(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "offset.json")
+	if err := NewFileOffsetStore(path).Save(OffsetRecord{GTIDSet: serverA + ":1-5"}); err != nil {
+		t.Fatal(err)
+	}
+
+	first := newFileListener(t, path, "t1")
+	mustDo(t, first.loadOffset())
+	if first.record.GTIDSet != "" {
+		t.Fatalf("the token did not discard the offset: %+v", first.record)
+	}
+	mustDo(t, first.saveOffset(serverA+":1-9"))
+
+	second := newFileListener(t, path, "t1")
+	mustDo(t, second.loadOffset())
+	if second.record.GTIDSet != serverA+":1-9" {
+		t.Fatalf("the same token discarded the offset again: %+v", second.record)
+	}
+
+	third := newFileListener(t, path, "t2")
+	mustDo(t, third.loadOffset())
+	if third.record.GTIDSet != "" {
+		t.Fatalf("a new token must discard again: %+v", third.record)
+	}
+}
+
+func TestNoTokenKeepsTheOffsetAndALegacyOffsetIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "offset.json")
+	mustDo(t, NewFileOffsetStore(path).Save(OffsetRecord{GTIDSet: serverA + ":1-5"}))
+	l := newFileListener(t, path, "")
+	mustDo(t, l.loadOffset())
+	if l.record.GTIDSet != serverA+":1-5" {
+		t.Fatalf("record = %+v", l.record)
+	}
+
+	legacy := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(legacy, []byte(`{"file":"mysql-bin.000003","position":4}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := newFileListener(t, legacy, "").loadOffset(); !errors.Is(err, ErrLegacyOffset) {
+		t.Fatalf("err = %v, want ErrLegacyOffset", err)
+	}
+	// The token is the way out of it.
+	l = newFileListener(t, legacy, "t1")
+	mustDo(t, l.loadOffset())
+}
+
+func TestSetOffsetStoreReplacesTheStore(t *testing.T) {
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	store := NewFileOffsetStore(filepath.Join(t.TempDir(), "o.json"))
+	l.SetOffsetStore(store)
+	if l.offsetStore != store {
+		t.Fatal("store not set")
+	}
+}
+
+// A stream that ends with an error while the listener should be running must
+// reach the watcher, which exits on it instead of idling.
+func TestStreamingErrorIsReportedAsAFailure(t *testing.T) {
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	l.running.Store(true)
+	cause := errors.New("binlog stream broke")
+	l.reportFailure(cause)
+	select {
+	case got := <-l.Failed():
+		if !errors.Is(got, cause) {
+			t.Fatalf("failure = %v", got)
+		}
+	default:
+		t.Fatal("a streaming error was swallowed")
+	}
+}
+
+func TestStopAndCleanEndsAreNotFailures(t *testing.T) {
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	l.running.Store(true)
+	l.reportFailure(nil)
+	l.running.Store(false)
+	l.reportFailure(errors.New("closed by Stop"))
+	select {
+	case got := <-l.Failed():
+		t.Fatalf("unexpected failure %v", got)
+	default:
+	}
+}
+
+type scriptedStore struct {
+	loaded  OffsetRecord
+	loadErr error
+	saved   []OffsetRecord
+}
+
+func (s *scriptedStore) Load() (OffsetRecord, error) { return s.loaded, s.loadErr }
+func (s *scriptedStore) Save(r OffsetRecord) error   { s.saved = append(s.saved, r); return nil }
+
+// A lost offset stops the watcher; the reset token is the explicit way past it.
+func TestLostOffsetNeedsTheResetToken(t *testing.T) {
+	store := &scriptedStore{loadErr: ErrOffsetLost}
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	l.SetOffsetStore(store)
+	if err := l.loadOffset(); !errors.Is(err, ErrOffsetLost) {
+		t.Fatalf("err = %v, want ErrOffsetLost", err)
+	}
+
+	l, _ = NewListener(config.MySQLConfig{ResetOffset: "t1"}, cdc.NewService())
+	l.SetOffsetStore(store)
+	mustDo(t, l.loadOffset())
+	if len(store.saved) != 1 || store.saved[0].ResetToken != "t1" {
+		t.Fatalf("the token was not saved: %+v", store.saved)
+	}
+}
+
+// The marker remembers the last token used. A token still set from an earlier
+// reset must not wave a lost offset through; only a different one may.
+func TestLostOffsetWithAStaleTokenStaysRefused(t *testing.T) {
+	store := &scriptedStore{loaded: OffsetRecord{ResetToken: "t1"}, loadErr: ErrOffsetLost}
+	l, _ := NewListener(config.MySQLConfig{ResetOffset: "t1"}, cdc.NewService())
+	l.SetOffsetStore(store)
+	if err := l.loadOffset(); !errors.Is(err, ErrOffsetLost) {
+		t.Fatalf("err = %v, want ErrOffsetLost", err)
+	}
+	if len(store.saved) != 0 {
+		t.Fatalf("a refused start saved %+v", store.saved)
+	}
+
+	l, _ = NewListener(config.MySQLConfig{ResetOffset: "t2"}, cdc.NewService())
+	l.SetOffsetStore(store)
+	mustDo(t, l.loadOffset())
+	if len(store.saved) != 1 || store.saved[0].ResetToken != "t2" || store.saved[0].GTIDSet != "" {
+		t.Fatalf("a new token did not reset: %+v", store.saved)
+	}
+}
+
+func TestLostOffsetWithNoTokenIsRefusedWhateverTheMarkerHolds(t *testing.T) {
+	store := &scriptedStore{loaded: OffsetRecord{ResetToken: "t1"}, loadErr: ErrOffsetLost}
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	l.SetOffsetStore(store)
+	if err := l.loadOffset(); !errors.Is(err, ErrOffsetLost) {
+		t.Fatalf("err = %v, want ErrOffsetLost", err)
 	}
 }

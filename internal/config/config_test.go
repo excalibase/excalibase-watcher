@@ -435,3 +435,51 @@ func TestLoadAcceptsDottedSubjectPrefix(t *testing.T) {
 }
 
 func strconvQuote(s string) string { return strconv.Quote(s) }
+
+func loadMySQLYAML(t *testing.T, body string) (*Config, error) {
+	t.Helper()
+	cfgFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("mysql:\n"+body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return Load(cfgFile)
+}
+
+func TestMySQLOffsetBucketDefaultsAndRejectsBadNames(t *testing.T) {
+	cfg, err := loadMySQLYAML(t, "  enabled: true\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MySQL.OffsetBucket != "WATCHER_MYSQL_OFFSETS" || cfg.MySQL.ResetOffset != "" || cfg.MySQL.OffsetReplicas != 3 {
+		t.Errorf("defaults: bucket %q reset %q replicas %d", cfg.MySQL.OffsetBucket, cfg.MySQL.ResetOffset, cfg.MySQL.OffsetReplicas)
+	}
+	if _, err := loadMySQLYAML(t, "  enabled: true\n  offset_bucket: \"bad name!\"\n"); err == nil {
+		t.Fatal("Load accepted a bucket name JetStream refuses")
+	}
+}
+
+func TestMySQLResetOffsetFromTheEnvironment(t *testing.T) {
+	t.Setenv("WATCHER_MYSQL_RESET_OFFSET", "2026-11-26-purged")
+	cfg, err := loadMySQLYAML(t, "  enabled: true\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MySQL.ResetOffset != "2026-11-26-purged" {
+		t.Error("reset_offset not read from WATCHER_MYSQL_RESET_OFFSET")
+	}
+}
+
+// A watcher with MySQL off must not be stopped by a MySQL setting.
+func TestMySQLOffsetSettingsAreOnlyCheckedWhenMySQLIsOn(t *testing.T) {
+	if _, err := loadMySQLYAML(t, "  enabled: false\n  offset_bucket: \"bad name!\"\n"); err != nil {
+		t.Fatalf("a disabled MySQL's bucket was validated: %v", err)
+	}
+	if _, err := loadMySQLYAML(t, "  enabled: true\n  offset_bucket: \"bad name!\"\n"); err == nil {
+		t.Fatal("an enabled MySQL accepted a bad bucket name")
+	}
+	for _, replicas := range []string{"0", "6", "-1"} {
+		if _, err := loadMySQLYAML(t, "  enabled: true\n  offset_replicas: "+replicas+"\n"); err == nil {
+			t.Errorf("offset_replicas %s accepted", replicas)
+		}
+	}
+}
