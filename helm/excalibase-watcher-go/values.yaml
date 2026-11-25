@@ -120,13 +120,20 @@ mysql:
   snapshotMode: "none"          # none | chunked | backup_file
   snapshotChunkSize: 10000
 
-  # Offset persistence file path (default: /data/binlog.offset)
-  # Critical: if empty, restart replays binlog from current position and may lose events.
-  offsetFile: "/data/binlog.offset"
+  # Where the resume offset (a GTID set) is kept. Empty (the default) keeps it
+  # in the NATS JetStream bucket below, so the pod needs no volume. Set a file
+  # path and enable persistence to keep it on a PVC instead.
+  offsetFile: ""
+  offsetBucket: "WATCHER_MYSQL_OFFSETS"
 
-  # Persistent volume for offset storage (strongly recommended in production)
+  # Discard the saved offset for one start and stream from the server's current
+  # position. The way out of a purged offset (the watcher fails with a clear
+  # error); unset it again after that start.
+  resetOffset: false
+
+  # Persistent volume for the offset file (only with offsetFile)
   persistence:
-    enabled: true
+    enabled: false
     # existingClaim: ""        # use existing PVC instead of creating one
     storageClass: ""           # empty = use cluster default
     size: 1Gi

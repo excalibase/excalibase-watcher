@@ -52,6 +52,8 @@ data:
       {{- if .Values.mysql.offsetFile }}
       offset_file: {{ .Values.mysql.offsetFile | quote }}
       {{- end }}
+      offset_bucket: {{ .Values.mysql.offsetBucket | quote }}
+      reset_offset: {{ .Values.mysql.resetOffset }}
 
     nats:
       enabled: {{ .Values.nats.enabled }}

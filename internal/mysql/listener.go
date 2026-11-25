@@ -17,8 +17,7 @@ import (
 	"github.com/excalibase/watcher-go/internal/config"
 	"github.com/excalibase/watcher-go/internal/jsonutil"
 	"github.com/go-mysql-org/go-mysql/canal"
-	"github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/go-mysql-org/go-mysql/replication"
+	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/schema"
 )
 
@@ -32,7 +31,7 @@ type Listener struct {
 	cancel      context.CancelFunc
 	wg          sync.WaitGroup
 	gate        *commitGate
-	savedOffset BinlogPosition
+	savedOffset string
 	failed      chan error
 }
 
@@ -50,6 +49,9 @@ func (l *Listener) PublishedObserver() func(cdc.Event) {
 	return l.gate.ObservePublished
 }
 
+// NewListener keeps the offset in cfg.OffsetFile when it is set; otherwise
+// call SetOffsetStore before Start, or the listener resumes from the server's
+// current position on every start.
 func NewListener(cfg config.MySQLConfig, service *cdc.Service) (*Listener, error) {
 	var store OffsetStore
 	if cfg.OffsetFile != "" {
@@ -65,6 +67,11 @@ func NewListener(cfg config.MySQLConfig, service *cdc.Service) (*Listener, error
 	}, nil
 }
 
+// SetOffsetStore replaces the store; call it before Start.
+func (l *Listener) SetOffsetStore(store OffsetStore) {
+	l.offsetStore = store
+}
+
 func (l *Listener) Start(ctx context.Context) error {
 	if l.running.Load() {
 		return errors.New("listener already running")
@@ -75,6 +82,12 @@ func (l *Listener) Start(ctx context.Context) error {
 	// the watcher will not connect to.
 	canalConfig, err := l.buildCanalConfig()
 	if err != nil {
+		return err
+	}
+	if l.offsetStore == nil {
+		slog.Warn("mysql: no offset store; every restart resumes from the server's current position and loses what happened meanwhile")
+	}
+	if err := l.resetOffsetIfAsked(); err != nil {
 		return err
 	}
 
@@ -88,18 +101,19 @@ func (l *Listener) Start(ctx context.Context) error {
 	}
 	l.canal = c
 
-	handler := &eventHandler{service: l.service, gate: l.gate}
-	c.SetEventHandler(handler)
-	l.handler = handler
-
-	startPos, err := l.resolveStartPosition(c)
+	if err := verifyServer(c, l.cfg.Schema, l.cfg.Tables); err != nil {
+		c.Close()
+		return err
+	}
+	startSet, err := l.resolveStartSet(c)
 	if err != nil {
+		c.Close()
 		return err
 	}
 
-	handler.lastPosMu.Lock()
-	handler.currentFile = startPos.File
-	handler.lastPosMu.Unlock()
+	handler := &eventHandler{service: l.service, gate: l.gate, executed: startSet.Clone()}
+	c.SetEventHandler(handler)
+	l.handler = handler
 
 	l.running.Store(true)
 
@@ -111,14 +125,34 @@ func (l *Listener) Start(ctx context.Context) error {
 	l.wg.Add(1)
 	go func() {
 		defer l.wg.Done()
-		runErr := c.RunFrom(mysql.Position{Name: startPos.File, Pos: startPos.Position})
-		if runErr != nil && l.running.Load() {
-			slog.Error("canal stopped with error", "error", runErr)
-			l.failed <- runErr
-		}
+		l.reportFailure(streamFrom(c, startSet))
 	}()
 
 	return nil
+}
+
+// reportFailure delivers the error that ended streaming, unless the listener
+// was stopped on purpose.
+func (l *Listener) reportFailure(err error) {
+	if err == nil || !l.running.Load() {
+		return
+	}
+	slog.Error("canal stopped with error", "error", err)
+	l.failed <- err
+}
+
+// streamFrom runs canal from the GTID set. A server that has executed nothing
+// yet has no set to name, so canal starts at its current binlog position,
+// which is the same place.
+func streamFrom(c *canal.Canal, start gomysql.GTIDSet) error {
+	if start.String() != "" {
+		return c.StartFromGTID(start)
+	}
+	pos, err := c.GetMasterPos()
+	if err != nil {
+		return fmt.Errorf("getting the server's binlog position: %w", err)
+	}
+	return c.RunFrom(pos)
 }
 
 func (l *Listener) buildCanalConfig() (*canal.Config, error) {
@@ -145,32 +179,48 @@ func (l *Listener) buildCanalConfig() (*canal.Config, error) {
 	return cfg, nil
 }
 
-// resolveStartPosition returns the persisted offset, or the current master
-// position on first start. Canal with dump disabled would otherwise begin at
-// position 0 of the oldest binlog file and flood the pipeline on startup.
-func (l *Listener) resolveStartPosition(c *canal.Canal) (*BinlogPosition, error) {
-	startPos, err := l.getStartPosition()
-	if err != nil {
-		return nil, fmt.Errorf("getting start position: %w", err)
+// resetOffsetIfAsked drops the saved offset when the operator set
+// mysql.reset_offset: the way out of a purged or foreign offset.
+func (l *Listener) resetOffsetIfAsked() error {
+	if !l.cfg.ResetOffset || l.offsetStore == nil {
+		return nil
 	}
-	if startPos != nil {
-		return startPos, nil
-	}
-	pos, err := c.GetMasterPos()
-	if err != nil {
-		return nil, fmt.Errorf("getting current master position: %w", err)
-	}
-	startPos = &BinlogPosition{File: pos.Name, Position: pos.Pos}
-	slog.Info("no persisted offset, starting from current master position",
-		"file", pos.Name, "position", pos.Pos)
+	slog.Warn("mysql.reset_offset is set: discarding the saved offset, streaming from the server's current position")
+	return l.offsetStore.Clear()
+}
+
+// resolveStartSet returns the GTID set to stream from. On first start that is
+// everything the server has executed, never the start of the binlog, which
+// would flood the pipeline; the set is saved at once so a restart before the
+// first transaction still resumes from the same place.
+func (l *Listener) resolveStartSet(c *canal.Canal) (gomysql.GTIDSet, error) {
+	var saved string
 	if l.offsetStore != nil {
-		if err := l.offsetStore.Save(*startPos); err != nil {
-			slog.Warn("failed to save initial offset", "error", err)
-		} else {
-			l.savedOffset = *startPos
+		var err error
+		if saved, err = l.offsetStore.Load(); err != nil {
+			return nil, fmt.Errorf("loading saved offset: %w", err)
 		}
 	}
-	return startPos, nil
+	executed, purged, err := serverGTIDSets(c)
+	if err != nil {
+		return nil, err
+	}
+	start, fresh, err := resolveStart(saved, executed, purged)
+	if err != nil {
+		return nil, err
+	}
+	if !fresh {
+		slog.Info("resuming from the saved GTID set", "gtid_set", start.String())
+		return start, nil
+	}
+	slog.Info("no saved offset, starting from the server's executed GTID set", "gtid_set", start.String())
+	if l.offsetStore != nil && start.String() != "" {
+		if err := l.offsetStore.Save(start.String()); err != nil {
+			return nil, fmt.Errorf("saving initial offset: %w", err)
+		}
+		l.savedOffset = start.String()
+	}
+	return start, nil
 }
 
 func (l *Listener) Stop() {
@@ -185,8 +235,8 @@ func (l *Listener) Stop() {
 	}
 	l.wg.Wait()
 
-	// Flush the last fully acked boundary — never the canal position — so
-	// restart re-delivers every transaction that wasn't fully acked.
+	// Flush the last fully acked boundary, so restart re-delivers every
+	// transaction that wasn't fully acked.
 	if l.offsetStore != nil {
 		if err := l.saveConfirmedOffset(); err != nil {
 			slog.Warn("failed to flush final offset", "error", err)
@@ -215,26 +265,19 @@ func (l *Listener) offsetSaver(ctx context.Context) {
 // saveConfirmedOffset writes the newest boundary whose events are all acked,
 // when it moved since the last save.
 func (l *Listener) saveConfirmedOffset() error {
-	pos, ok := l.gate.Confirmable()
-	if !ok || pos == l.savedOffset {
+	gtidSet, ok := l.gate.Confirmable()
+	if !ok || gtidSet == l.savedOffset {
 		return nil
 	}
-	if err := l.offsetStore.Save(pos); err != nil {
+	if err := l.offsetStore.Save(gtidSet); err != nil {
 		return err
 	}
-	l.savedOffset = pos
+	l.savedOffset = gtidSet
 	return nil
 }
 
 func (l *Listener) IsRunning() bool {
 	return l.running.Load()
-}
-
-func (l *Listener) getStartPosition() (*BinlogPosition, error) {
-	if l.offsetStore == nil {
-		return nil, nil
-	}
-	return l.offsetStore.Load()
 }
 
 func (l *Listener) runSnapshot() error {
@@ -243,179 +286,19 @@ func (l *Listener) runSnapshot() error {
 		if l.cfg.SnapshotBackupFile == "" {
 			return errors.New("snapshot_backup_file required for backup_file mode")
 		}
-		pos, err := ParseMysqlDumpFile(l.cfg.SnapshotBackupFile, l.cfg.Schema, func(e cdc.Event) {
+		gtidSet, err := ParseMysqlDumpFile(l.cfg.SnapshotBackupFile, l.cfg.Schema, func(e cdc.Event) {
 			l.service.HandleEvent(e)
 		})
 		if err != nil {
 			return err
 		}
-		if l.offsetStore != nil && pos.File != "" {
-			return l.offsetStore.Save(pos)
+		if l.offsetStore != nil && gtidSet != "" {
+			return l.offsetStore.Save(gtidSet)
 		}
 		return nil
 	default:
 		return nil
 	}
-}
-
-// eventHandler implements canal.EventHandler
-type eventHandler struct {
-	canal.DummyEventHandler
-	service *cdc.Service
-	gate    *commitGate
-
-	// currentFile is updated by OnRotate; OnRow combines it with Header.LogPos.
-	lastPosMu   sync.Mutex
-	currentFile string
-
-	// txn is the open transaction (end of its GTID event) and txnRows the
-	// rows seen in it so far; only canal's goroutine touches them.
-	txn     BinlogPosition
-	txnRows int
-}
-
-// emit passes an event to the bus and counts it toward the commit gate when
-// it will be published.
-func (h *eventHandler) emit(event cdc.Event) {
-	if h.service.HandleEvent(event) && ownEvent(event) {
-		h.gate.Hand()
-	}
-}
-
-func (h *eventHandler) committed(pos mysql.Position) {
-	h.gate.Committed(BinlogPosition{File: pos.Name, Position: pos.Pos})
-}
-
-// currentBinlogFile returns the current binlog filename (tracked via OnRotate).
-func (h *eventHandler) currentBinlogFile() string {
-	h.lastPosMu.Lock()
-	defer h.lastPosMu.Unlock()
-	return h.currentFile
-}
-
-// errUnplacedRow means a row arrived with no binlog position and no enclosing
-// transaction, so no message id would be both unique and stable on replay.
-var errUnplacedRow = errors.New("mysql row event has no binlog position and no enclosing transaction; " +
-	"refusing to publish it under an id that could collide")
-
-func (h *eventHandler) OnRow(e *canal.RowsEvent) error {
-	rowID, lsn, err := h.rowIDs(e)
-	if err != nil {
-		return err
-	}
-	publish := func(event cdc.Event, row int) {
-		if rowID != nil {
-			event.SourceID = rowID(row)
-		}
-		h.emit(event)
-	}
-
-	schemaName := e.Table.Schema
-	table := e.Table.Name
-	switch e.Action {
-	case canal.InsertAction:
-		for i, row := range e.Rows {
-			data := rowToJSON(e.Table, row)
-			publish(cdc.NewEvent(cdc.Insert, schemaName, table, data, "INSERT", lsn), i)
-		}
-	case canal.UpdateAction:
-		for i := 0; i+1 < len(e.Rows); i += 2 {
-			oldData := rowToJSON(e.Table, e.Rows[i])
-			newData := rowToJSON(e.Table, e.Rows[i+1])
-			data := fmt.Sprintf(`{"old":%s, "new":%s}`, oldData, newData)
-			publish(cdc.NewEvent(cdc.Update, schemaName, table, data, "UPDATE", lsn), i/2)
-		}
-	case canal.DeleteAction:
-		for i, row := range e.Rows {
-			data := rowToJSON(e.Table, row)
-			publish(cdc.NewEvent(cdc.Delete, schemaName, table, data, "DELETE", lsn), i)
-		}
-	}
-	return nil
-}
-
-// rowIDs returns how to build each row's source id, and the event's position.
-//
-// A rows event's own position is shared by all its rows, so the row index
-// tells them apart. Events inside a compressed transaction payload carry
-// position 0, so their rows are placed by the enclosing transaction (the end
-// of its GTID event) and their order within it. Both are the same on replay.
-func (h *eventHandler) rowIDs(e *canal.RowsEvent) (func(row int) string, string, error) {
-	file := h.currentBinlogFile()
-	if file == "" || e.Header == nil {
-		return nil, "", nil
-	}
-	if e.Header.LogPos != 0 {
-		lsn := fmt.Sprintf("%s:%d", file, e.Header.LogPos)
-		return func(row int) string { return fmt.Sprintf("%s%s:%d", sourcePrefix, lsn, row) }, lsn, nil
-	}
-	if h.txn.File == "" {
-		return nil, "", errUnplacedRow
-	}
-	lsn := h.txn.String()
-	first := h.txnRows
-	h.txnRows += rowCount(e)
-	return func(row int) string { return fmt.Sprintf("%s%s:txn:%d", sourcePrefix, lsn, first+row) }, lsn, nil
-}
-
-func rowCount(e *canal.RowsEvent) int {
-	if e.Action == canal.UpdateAction {
-		return len(e.Rows) / 2
-	}
-	return len(e.Rows)
-}
-
-// OnGTID opens a transaction (anonymous GTIDs included). Where its GTID event
-// starts is a transaction boundary: the only one a compressed transaction
-// offers, since the XID inside its payload carries position 0.
-func (h *eventHandler) OnGTID(header *replication.EventHeader, _ mysql.BinlogGTIDEvent) error {
-	h.txn = BinlogPosition{}
-	h.txnRows = 0
-	file := h.currentBinlogFile()
-	if header == nil || file == "" || header.LogPos == 0 {
-		return nil
-	}
-	h.txn = BinlogPosition{File: file, Position: header.LogPos}
-	if header.LogPos >= header.EventSize {
-		h.gate.Committed(BinlogPosition{File: file, Position: header.LogPos - header.EventSize})
-	}
-	return nil
-}
-
-// OnRotate tracks the current binlog file so OnRow can stamp events with
-// the correct position. A rotate falls between transactions, so it is a
-// boundary too: an idle offset moves on to the new file.
-func (h *eventHandler) OnRotate(_ *replication.EventHeader, ev *replication.RotateEvent) error {
-	h.lastPosMu.Lock()
-	h.currentFile = string(ev.NextLogName)
-	h.lastPosMu.Unlock()
-	h.committed(mysql.Position{Name: string(ev.NextLogName), Pos: uint32(ev.Position)})
-	return nil
-}
-
-func (h *eventHandler) OnDDL(_ *replication.EventHeader, nextPos mysql.Position, queryEvent *replication.QueryEvent) error {
-	ddlSchema := string(queryEvent.Schema)
-	query := string(queryEvent.Query)
-	// Match Java format: raw SQL as data field
-	event := cdc.NewEvent(cdc.DDL, ddlSchema, "", query, "DDL", "")
-	if nextPos.Name != "" {
-		event.SourceID = fmt.Sprintf("%s%s:%d:ddl", sourcePrefix, nextPos.Name, nextPos.Pos)
-	}
-	h.emit(event)
-	h.committed(nextPos)
-	return nil
-}
-
-// OnXID closes a transaction. Its position is only persisted once every row
-// handed before it is acked (see commitGate), never per rows event.
-func (h *eventHandler) OnXID(_ *replication.EventHeader, nextPos mysql.Position) error {
-	h.service.HandleEvent(cdc.NewEvent(cdc.Commit, "", "", "", "COMMIT", ""))
-	h.committed(nextPos)
-	return nil
-}
-
-func (h *eventHandler) String() string {
-	return "excalibase-watcher-mysql"
 }
 
 func rowToJSON(table *schema.Table, row []interface{}) string {

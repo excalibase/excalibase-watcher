@@ -146,6 +146,14 @@ func startMySQL(ctx context.Context, cfg *config.Config, service *cdc.Service, p
 		// Wired before Start: the offset only advances past transactions
 		// whose every row NATS has acknowledged.
 		pub.AddOnPublished(mysqlListener.PublishedObserver())
+		if cfg.MySQL.OffsetFile == "" {
+			store, err := mysqllistener.NewKVOffsetStore(ctx, pub.JetStream(), cfg.MySQL.OffsetBucket,
+				mysqllistener.OffsetKey(cfg.NATS.SubjectPrefix, cfg.MySQL.Schema))
+			if err != nil {
+				return nil, fmt.Errorf("opening mysql offset store: %w", err)
+			}
+			mysqlListener.SetOffsetStore(store)
+		}
 	}
 	if err := mysqlListener.Start(ctx); err != nil {
 		return nil, fmt.Errorf("starting mysql listener: %w", err)

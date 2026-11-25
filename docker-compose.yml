@@ -27,6 +27,8 @@ services:
       - --log-bin=mysql-bin
       - --binlog-format=ROW
       - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
       - --server-id=1
 
   nats:

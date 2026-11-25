@@ -112,7 +112,7 @@ helm install watcher-tenant-b helm/excalibase-watcher-go/ \
 
 Each tenant:
 - Has its own PG replication slot (separate slot name per release via `postgres.slotName`, or use `nameOverride` suffix)
-- Has its own MySQL offset file (on its own PVC)
+- Has its own MySQL offset: a key in the shared NATS offset bucket (per subject prefix and schema), no PVC needed
 - Publishes under its own subject prefix
 - Shares the NATS stream with all other tenants
 

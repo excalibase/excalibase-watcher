@@ -116,7 +116,7 @@ Examples:
 - `helm/examples/both-dbs.yaml`
 - `helm/examples/multi-tenant.yaml` — N watchers sharing one NATS stream
 
-**MySQL offset persistence** requires a PVC. Enabled by default in the chart (`mysql.persistence.enabled=true`).
+**MySQL resume offset.** The watcher resumes by GTID set, saved only after a whole transaction was published and acknowledged. The set lives in a JetStream key-value bucket (`mysql.offset_bucket`, file storage, one key per subject prefix and schema), so the pod needs no volume and a failover to another replica keeps its place. `mysql.offset_file` keeps it in a file instead (that needs a PVC). The server must run with `gtid_mode=ON`, `enforce_gtid_consistency=ON`, `binlog_format=ROW`, `binlog_row_image=FULL`, and the login needs `REPLICATION SLAVE`, `REPLICATION CLIENT` and `SELECT`; the watcher checks all of it at start and lists what is wrong. If the saved set was purged from the server's binlogs the watcher refuses to start; set `mysql.reset_offset` (`WATCHER_MYSQL_RESET_OFFSET=true`) for one start to continue from the server's current position, and re-snapshot the data downstream.
 
 **NATS stream provisioning** is separate from the chart by default. Opt into the chart's pre-install Job with `nats.streamInit.enabled=true` for dev clusters, or use terraform / external tooling for production.
 

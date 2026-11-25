@@ -8,13 +8,6 @@ import (
 	"github.com/go-mysql-org/go-mysql/schema"
 )
 
-func TestBinlogPositionString(t *testing.T) {
-	p := BinlogPosition{File: "mysql-bin.000007", Position: 4242}
-	if got := p.String(); got != "mysql-bin.000007:4242" {
-		t.Errorf("got %q", got)
-	}
-}
-
 func TestGenerateServerIDDeterministic(t *testing.T) {
 	a := generateServerID("host-a")
 	b := generateServerID("host-a")

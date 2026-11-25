@@ -83,6 +83,12 @@ func (p *Publisher) AddOnPublished(fn func(cdc.Event)) {
 	p.observers.Store(&observers)
 }
 
+// JetStream is the JetStream context of the publisher's connection, for the
+// small amount of state (offsets) that lives beside the stream. Valid after Start.
+func (p *Publisher) JetStream() jetstream.JetStream {
+	return p.js
+}
+
 // Ready reports whether events can be published right now: connected, with
 // the stream verified.
 func (p *Publisher) Ready() bool {

@@ -27,13 +27,16 @@ type watcherProcess struct {
 	listener *Listener
 }
 
-func startWatcherProcess(t *testing.T, mysqlCfg config.MySQLConfig, natsCfg config.NATSConfig) *watcherProcess {
+func startWatcherProcess(t *testing.T, mysqlCfg config.MySQLConfig, natsCfg config.NATSConfig, store OffsetStore) *watcherProcess {
 	t.Helper()
 	svc := cdc.NewService()
 	pub := natspub.NewPublisher(natsCfg, svc)
 	listener, err := NewListener(mysqlCfg, svc)
 	if err != nil {
 		t.Fatalf("NewListener: %v", err)
+	}
+	if store != nil {
+		listener.SetOffsetStore(store)
 	}
 	pub.AddOnPublished(listener.PublishedObserver())
 	if err := pub.Start(context.Background()); err != nil {
@@ -114,7 +117,7 @@ func insertRows(t *testing.T, addr, prefix string, count int) []string {
 // restart every row must be in the stream exactly once: none skipped, and
 // rows already published deduplicated by a message id that is the same on
 // the replay and different for every row.
-func crashMidTransactionLosesNoRow(t *testing.T, mysqlFlags ...string) {
+func crashMidTransactionLosesNoRow(t *testing.T, useKV bool, mysqlFlags ...string) {
 	addr, _, cleanup := setupMySQLWithFlags(t, mysqlFlags...)
 	defer cleanup()
 	ctx := context.Background()
@@ -136,9 +139,18 @@ func crashMidTransactionLosesNoRow(t *testing.T, mysqlFlags ...string) {
 
 	mysqlCfg := makeMySQLConfig(addr)
 	mysqlCfg.Tables = []string{"cdc_test_users"}
-	mysqlCfg.OffsetFile = filepath.Join(t.TempDir(), "binlog.offset")
+	var store OffsetStore
+	if useKV {
+		kv, err := NewKVOffsetStore(ctx, js, "OFFSETS", OffsetKey(natsCfg.SubjectPrefix, mysqlCfg.Schema))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store = kv
+	} else {
+		mysqlCfg.OffsetFile = filepath.Join(t.TempDir(), "gtid.offset")
+	}
 
-	first := startWatcherProcess(t, mysqlCfg, natsCfg)
+	first := startWatcherProcess(t, mysqlCfg, natsCfg, store)
 	time.Sleep(3 * time.Second)
 
 	names := insertRows(t, addr, "a", 3)
@@ -153,7 +165,7 @@ func crashMidTransactionLosesNoRow(t *testing.T, mysqlFlags ...string) {
 		t.Fatalf("lift stream limit: %v", err)
 	}
 
-	second := startWatcherProcess(t, mysqlCfg, natsCfg)
+	second := startWatcherProcess(t, mysqlCfg, natsCfg, store)
 	defer second.crash()
 	waitForStreamMsgs(t, js, natsCfg.StreamName, uint64(len(names)), 60*time.Second)
 	time.Sleep(2 * time.Second)
@@ -167,12 +179,16 @@ func crashMidTransactionLosesNoRow(t *testing.T, mysqlFlags ...string) {
 }
 
 func TestCrashMidRowsEventLosesNoRow(t *testing.T) {
-	crashMidTransactionLosesNoRow(t)
+	crashMidTransactionLosesNoRow(t, false)
 }
 
-// Events inside a compressed transaction payload carry binlog position 0, so
-// a position-based message id would be the same for the first row of every
-// compressed transaction and the stream would drop all but one of them.
+// The same crash with the offset in the NATS bucket the platform uses.
+func TestCrashMidRowsEventLosesNoRowWithTheOffsetInNATS(t *testing.T) {
+	crashMidTransactionLosesNoRow(t, true)
+}
+
+// Rows inside a compressed transaction payload carry no binlog position of
+// their own; the GTID and row order must still give each its own message id.
 func TestCompressedTransactionsLoseNoRow(t *testing.T) {
-	crashMidTransactionLosesNoRow(t, "--binlog-transaction-compression=ON")
+	crashMidTransactionLosesNoRow(t, false, "--binlog-transaction-compression=ON")
 }

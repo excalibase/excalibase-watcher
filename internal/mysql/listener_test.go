@@ -6,7 +6,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -35,6 +34,19 @@ const mysqlTLSDir = "/etc/mysql-tls"
 // own CA for localhost, refuses plaintext, and root must use TLS.
 func setupMySQLWithFlags(t *testing.T, flags ...string) (string, int, func()) {
 	t.Helper()
+	return setupMySQLOn(t, mysqlNode{}, flags...)
+}
+
+// mysqlNode places a server on a shared Docker network under an alias, so a
+// replica can reach its source; bare skips the test schema and root's SSL
+// requirement, which a replica receives by replication.
+type mysqlNode struct {
+	network, alias string
+	bare           bool
+}
+
+func setupMySQLOn(t *testing.T, node mysqlNode, flags ...string) (string, int, func()) {
+	t.Helper()
 	ctx := context.Background()
 	ca := newTestCA(t)
 	certPEM, keyPEM := ca.issue(t, "localhost")
@@ -62,10 +74,14 @@ func setupMySQLWithFlags(t *testing.T, flags ...string) (string, int, func()) {
 				"--ssl-cert=" + mysqlTLSDir + "/server.pem",
 				"--ssl-key=" + mysqlTLSDir + "/server-key.pem",
 				"--require-secure-transport=ON",
+				"--gtid-mode=ON",
+				"--enforce-gtid-consistency=ON",
 			}, flags...),
 			WaitingFor: wait.ForLog("ready for connections").
 				WithOccurrence(2).
 				WithStartupTimeout(180 * time.Second),
+			Networks:       networksOf(node),
+			NetworkAliases: aliasesOf(node),
 		},
 		Started: true,
 	})
@@ -90,7 +106,7 @@ func setupMySQLWithFlags(t *testing.T, flags ...string) (string, int, func()) {
 
 	db := openTestDB(t, addr, 30, 2*time.Second)
 	defer db.Close()
-	for _, statement := range []string{
+	statements := []string{
 		"ALTER USER 'root'@'%' REQUIRE SSL",
 		`CREATE TABLE IF NOT EXISTS cdc_test_users (
 			id INT AUTO_INCREMENT PRIMARY KEY,
@@ -98,7 +114,11 @@ func setupMySQLWithFlags(t *testing.T, flags ...string) (string, int, func()) {
 			email VARCHAR(200),
 			active BOOLEAN DEFAULT true
 		)`,
-	} {
+	}
+	if node.bare {
+		statements = nil
+	}
+	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
 			t.Fatalf("%s: %v", statement, err)
 		}
@@ -108,6 +128,20 @@ func setupMySQLWithFlags(t *testing.T, flags ...string) (string, int, func()) {
 		container.Terminate(ctx)
 	}
 	return addr, port.Int(), cleanup
+}
+
+func networksOf(node mysqlNode) []string {
+	if node.network == "" {
+		return nil
+	}
+	return []string{node.network}
+}
+
+func aliasesOf(node mysqlNode) map[string][]string {
+	if node.network == "" {
+		return nil
+	}
+	return map[string][]string{node.network: {node.alias}}
 }
 
 // openTestDB opens addr as root over TLS verified against its CA, retrying
@@ -354,33 +388,3 @@ func TestMySQLDDLCapture(t *testing.T) {
 
 // A binlog stream that stops while the listener should be running must
 // surface, so the watcher exits instead of idling with CDC stalled.
-func TestStreamingErrorIsReportedAsAFailure(t *testing.T) {
-	addr, _, cleanup := setupMySQL(t)
-	defer cleanup()
-
-	offsetFile := filepath.Join(t.TempDir(), "binlog.offset")
-	if err := NewFileOffsetStore(offsetFile).Save(BinlogPosition{File: "mysql-bin.999999", Position: 4}); err != nil {
-		t.Fatal(err)
-	}
-	cfg := makeMySQLConfig(addr)
-	cfg.OffsetFile = offsetFile
-	svc := cdc.NewService()
-	defer svc.Shutdown()
-	listener, err := NewListener(cfg, svc)
-	if err != nil {
-		t.Fatalf("NewListener: %v", err)
-	}
-	if err := listener.Start(context.Background()); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	defer listener.Stop()
-
-	select {
-	case err := <-listener.Failed():
-		if err == nil {
-			t.Fatal("failure delivered without an error")
-		}
-	case <-time.After(60 * time.Second):
-		t.Fatal("streaming from a missing binlog file was never reported")
-	}
-}

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -64,7 +65,14 @@ type MySQLConfig struct {
 	SnapshotMode       string   `mapstructure:"snapshot_mode"`
 	SnapshotChunkSize  int      `mapstructure:"snapshot_chunk_size"`
 	SnapshotBackupFile string   `mapstructure:"snapshot_backup_file"`
-	OffsetFile         string   `mapstructure:"offset_file"`
+	// OffsetFile keeps the resume offset in a file (needs a volume that
+	// outlives the pod). Empty keeps it in the NATS JetStream bucket
+	// OffsetBucket instead, which is what Kubernetes wants.
+	OffsetFile   string `mapstructure:"offset_file"`
+	OffsetBucket string `mapstructure:"offset_bucket"`
+	// ResetOffset discards the saved offset for one start and streams from the
+	// server's current position: the way out of a purged or foreign offset.
+	ResetOffset bool `mapstructure:"reset_offset"`
 	// CACert is the PEM of the CA the server's certificate is signed by. The
 	// watcher connects only over TLS verified against it (EXC-589).
 	CACert string `mapstructure:"ca_cert"`
@@ -121,6 +129,7 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("mysql.enabled", false)
 	v.SetDefault("mysql.snapshot_mode", "none")
 	v.SetDefault("mysql.snapshot_chunk_size", 10000)
+	v.SetDefault("mysql.offset_bucket", "WATCHER_MYSQL_OFFSETS")
 
 	// Defaults — NATS
 	v.SetDefault("nats.enabled", true)
@@ -156,6 +165,8 @@ func Load(cfgFile string) (*Config, error) {
 	v.BindEnv("mysql.username", "WATCHER_MYSQL_USERNAME")
 	v.BindEnv("mysql.password", "WATCHER_MYSQL_PASSWORD")
 	v.BindEnv("mysql.ca_cert", "WATCHER_MYSQL_CA_CERT")
+	v.BindEnv("mysql.reset_offset", "WATCHER_MYSQL_RESET_OFFSET")
+	v.BindEnv("mysql.offset_bucket", "WATCHER_MYSQL_OFFSET_BUCKET")
 	v.BindEnv("nats.url", "WATCHER_NATS_URL")
 	v.BindEnv("nats.username", "WATCHER_NATS_USERNAME")
 	v.BindEnv("nats.password", "WATCHER_NATS_PASSWORD")
@@ -173,12 +184,18 @@ func Load(cfgFile string) (*Config, error) {
 		return nil, fmt.Errorf("mysql: %w", err)
 	}
 
+	if !bucketName.MatchString(cfg.MySQL.OffsetBucket) {
+		return nil, fmt.Errorf("mysql: invalid offset_bucket %q: use letters, digits, - and _", cfg.MySQL.OffsetBucket)
+	}
+
 	if err := ValidateSubjectPrefix(cfg.NATS.SubjectPrefix); err != nil {
 		return nil, fmt.Errorf("nats: %w", err)
 	}
 
 	return &cfg, nil
 }
+
+var bucketName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // ValidateSubjectPrefix refuses a prefix no event could be published under, so
 // a typo stops the watcher at startup instead of dropping every event.

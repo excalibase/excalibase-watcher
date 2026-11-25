@@ -6,13 +6,10 @@ import (
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/config"
-	"github.com/go-mysql-org/go-mysql/canal"
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/go-mysql-org/go-mysql/replication"
-	"github.com/go-mysql-org/go-mysql/schema"
 )
 
-func newGatedListener(t *testing.T) (*Listener, *eventHandler, string) {
+func newGatedListener(t *testing.T, executed string) (*Listener, *eventHandler, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "o.json")
 	l, err := NewListener(config.MySQLConfig{OffsetFile: path}, cdc.NewService())
@@ -20,81 +17,53 @@ func newGatedListener(t *testing.T) (*Listener, *eventHandler, string) {
 		t.Fatal(err)
 	}
 	l.PublishedObserver()
-	return l, &eventHandler{service: l.service, gate: l.gate, currentFile: "mysql-bin.000007"}, path
+	return l, &eventHandler{service: l.service, gate: l.gate, executed: gtidSet(t, executed)}, path
 }
 
-func loadOffset(t *testing.T, path string) *BinlogPosition {
+func loadOffset(t *testing.T, path string) string {
 	t.Helper()
-	pos, err := NewFileOffsetStore(path).Load()
+	set, err := NewFileOffsetStore(path).Load()
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	return pos
+	return set
 }
 
 func TestSaveConfirmedOffsetWithNothingConfirmedWritesNothing(t *testing.T) {
-	l, _, path := newGatedListener(t)
+	l, _, path := newGatedListener(t, "")
 	if err := l.saveConfirmedOffset(); err != nil {
 		t.Fatal(err)
 	}
-	if pos := loadOffset(t, path); pos != nil {
-		t.Errorf("offset written with nothing confirmed: %v", pos)
+	if set := loadOffset(t, path); set != "" {
+		t.Errorf("offset written with nothing confirmed: %q", set)
 	}
 }
 
-// A crash after two of three rows of one rows event were acked must resume
-// before that event, not after it.
-func TestOffsetNeverPassesAPartlyAckedRowsEvent(t *testing.T) {
-	l, h, path := newGatedListener(t)
+// A crash after two of three rows of one transaction were acked must resume
+// before that transaction, never after it.
+func TestOffsetNeverPassesAPartlyAckedTransaction(t *testing.T) {
+	l, h, path := newGatedListener(t, serverA+":1-3")
 	observe := l.gate.ObservePublished
 	ch, unsub := l.service.SubscribeAll()
 	defer unsub()
 
-	if err := h.OnXID(nil, gomysql.Position{Name: "mysql-bin.000007", Pos: 400}); err != nil {
-		t.Fatal(err)
-	}
-	rows := &canal.RowsEvent{
-		Table:  &schema.Table{Schema: "shop", Name: "orders", Columns: []schema.TableColumn{{Name: "id"}}},
-		Action: canal.InsertAction,
-		Rows:   [][]interface{}{{1}, {2}, {3}},
-		Header: &replication.EventHeader{LogPos: 700},
-	}
-	if err := h.OnRow(rows); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.OnXID(nil, gomysql.Position{Name: "mysql-bin.000007", Pos: 731}); err != nil {
-		t.Fatal(err)
-	}
+	mustDo(t, h.OnGTID(nil, txnGTID(4)))
+	mustDo(t, h.OnXID(nil, gomysql.Position{})) // an empty transaction first
+	mustDo(t, h.OnGTID(nil, txnGTID(5)))
+	mustDo(t, h.OnRow(rowsEvent(700, 1, 2, 3)))
+	mustDo(t, h.OnXID(nil, gomysql.Position{}))
 	<-ch // the first COMMIT
 	observe(<-ch)
 	observe(<-ch)
 
-	if err := l.saveConfirmedOffset(); err != nil {
-		t.Fatal(err)
-	}
-	if pos := loadOffset(t, path); pos == nil || pos.Position != 400 {
-		t.Fatalf("offset after 2 of 3 rows acked = %v, want mysql-bin.000007:400", pos)
+	mustDo(t, l.saveConfirmedOffset())
+	if got := loadOffset(t, path); got != serverA+":1-4" {
+		t.Fatalf("offset after 2 of 3 rows acked = %q, want %s:1-4", got, serverA)
 	}
 
 	observe(<-ch)
-	if err := l.saveConfirmedOffset(); err != nil {
-		t.Fatal(err)
-	}
-	if pos := loadOffset(t, path); pos == nil || pos.Position != 731 {
-		t.Fatalf("offset after every row acked = %v, want mysql-bin.000007:731", pos)
-	}
-}
-
-func TestOnRotateUpdatesCurrentFileAndIsABoundary(t *testing.T) {
-	h := &eventHandler{gate: newCommitGate()}
-	ev := &replication.RotateEvent{NextLogName: []byte("mysql-bin.000099"), Position: 4}
-	if err := h.OnRotate(nil, ev); err != nil {
-		t.Fatal(err)
-	}
-	if got := h.currentBinlogFile(); got != "mysql-bin.000099" {
-		t.Errorf("got %q", got)
-	}
-	if pos, _ := h.gate.Confirmable(); pos != (BinlogPosition{File: "mysql-bin.000099", Position: 4}) {
-		t.Errorf("rotate boundary = %v", pos)
+	mustDo(t, l.saveConfirmedOffset())
+	if got := loadOffset(t, path); got != serverA+":1-5" {
+		t.Fatalf("offset after every row acked = %q, want %s:1-5", got, serverA)
 	}
 }

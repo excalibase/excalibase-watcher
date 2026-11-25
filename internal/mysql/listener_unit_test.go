@@ -7,10 +7,6 @@ import (
 
 	"github.com/excalibase/watcher-go/internal/cdc"
 	"github.com/excalibase/watcher-go/internal/config"
-	"github.com/go-mysql-org/go-mysql/canal"
-	gomysql "github.com/go-mysql-org/go-mysql/mysql"
-	"github.com/go-mysql-org/go-mysql/replication"
-	"github.com/go-mysql-org/go-mysql/schema"
 )
 
 func TestNewListenerWithoutOffsetFile(t *testing.T) {
@@ -39,35 +35,6 @@ func TestNewListenerWithOffsetFile(t *testing.T) {
 	}
 }
 
-func TestGetStartPositionNoStore(t *testing.T) {
-	svc := cdc.NewService()
-	l, _ := NewListener(config.MySQLConfig{}, svc)
-	pos, err := l.getStartPosition()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pos != nil {
-		t.Errorf("expected nil pos, got %v", pos)
-	}
-}
-
-func TestGetStartPositionWithSavedOffset(t *testing.T) {
-	svc := cdc.NewService()
-	path := filepath.Join(t.TempDir(), "offset.json")
-	store := NewFileOffsetStore(path)
-	if err := store.Save(BinlogPosition{File: "mysql-bin.0005", Position: 9999}); err != nil {
-		t.Fatal(err)
-	}
-	l, _ := NewListener(config.MySQLConfig{OffsetFile: path}, svc)
-	pos, err := l.getStartPosition()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pos == nil || pos.File != "mysql-bin.0005" || pos.Position != 9999 {
-		t.Errorf("got %v", pos)
-	}
-}
-
 func TestRunSnapshotNoneMode(t *testing.T) {
 	svc := cdc.NewService()
 	l, _ := NewListener(config.MySQLConfig{SnapshotMode: ""}, svc)
@@ -88,57 +55,61 @@ func TestRunSnapshotBackupFileRequiresPath(t *testing.T) {
 	}
 }
 
-func TestEventHandlerCurrentBinlogFile(t *testing.T) {
-	h := &eventHandler{}
-	if got := h.currentBinlogFile(); got != "" {
-		t.Errorf("empty handler should return empty, got %q", got)
-	}
-	h.currentFile = "mysql-bin.000001"
-	if got := h.currentBinlogFile(); got != "mysql-bin.000001" {
-		t.Errorf("got %q", got)
-	}
-}
-
-// Every row of one binlog rows event shares its position, so the row index
-// makes each source id unique; replaying the binlog yields the same ids.
-func TestRowsGetPositionPlusRowIndexSourceIDs(t *testing.T) {
-	svc := cdc.NewService()
-	defer svc.Shutdown()
-	ch, unsub := svc.SubscribeAll()
-	defer unsub()
-	h := &eventHandler{service: svc, gate: newCommitGate(), currentFile: "mysql-bin.000003"}
-
-	rows := &canal.RowsEvent{
-		Table:  &schema.Table{Schema: "shop", Name: "orders", Columns: []schema.TableColumn{{Name: "id"}}},
-		Action: canal.InsertAction,
-		Rows:   [][]interface{}{{1}, {2}},
-		Header: &replication.EventHeader{LogPos: 4711},
-	}
-	for pass := 0; pass < 2; pass++ {
-		if err := h.OnRow(rows); err != nil {
+func TestResetOffsetClearsTheSavedOffsetOnlyWhenAsked(t *testing.T) {
+	for _, reset := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "offset.json")
+		l, err := NewListener(config.MySQLConfig{OffsetFile: path, ResetOffset: reset}, cdc.NewService())
+		if err != nil {
 			t.Fatal(err)
 		}
-		for i, want := range []string{"mysql:mysql-bin.000003:4711:0", "mysql:mysql-bin.000003:4711:1"} {
-			if got := (<-ch).SourceID; got != want {
-				t.Errorf("pass %d row %d source id = %q, want %q", pass, i, got, want)
-			}
+		if err := l.offsetStore.Save(serverA + ":1-5"); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.resetOffsetIfAsked(); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := l.offsetStore.Load()
+		if reset != (got == "") {
+			t.Errorf("reset_offset=%v left offset %q", reset, got)
 		}
 	}
 }
 
-func TestDDLGetsAPositionSourceID(t *testing.T) {
-	svc := cdc.NewService()
-	defer svc.Shutdown()
-	ch, unsub := svc.SubscribeAll()
-	defer unsub()
-	h := &eventHandler{service: svc, gate: newCommitGate()}
-
-	err := h.OnDDL(nil, gomysql.Position{Name: "mysql-bin.000003", Pos: 900},
-		&replication.QueryEvent{Schema: []byte("shop"), Query: []byte("ALTER TABLE orders ADD c INT")})
-	if err != nil {
-		t.Fatal(err)
+func TestSetOffsetStoreReplacesTheStore(t *testing.T) {
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	store := NewFileOffsetStore(filepath.Join(t.TempDir(), "o.json"))
+	l.SetOffsetStore(store)
+	if l.offsetStore != store {
+		t.Fatal("store not set")
 	}
-	if got := (<-ch).SourceID; got != "mysql:mysql-bin.000003:900:ddl" {
-		t.Errorf("DDL source id = %q", got)
+}
+
+// A stream that ends with an error while the listener should be running must
+// reach the watcher, which exits on it instead of idling.
+func TestStreamingErrorIsReportedAsAFailure(t *testing.T) {
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	l.running.Store(true)
+	cause := errors.New("binlog stream broke")
+	l.reportFailure(cause)
+	select {
+	case got := <-l.Failed():
+		if !errors.Is(got, cause) {
+			t.Fatalf("failure = %v", got)
+		}
+	default:
+		t.Fatal("a streaming error was swallowed")
+	}
+}
+
+func TestStopAndCleanEndsAreNotFailures(t *testing.T) {
+	l, _ := NewListener(config.MySQLConfig{}, cdc.NewService())
+	l.running.Store(true)
+	l.reportFailure(nil)
+	l.running.Store(false)
+	l.reportFailure(errors.New("closed by Stop"))
+	select {
+	case got := <-l.Failed():
+		t.Fatalf("unexpected failure %v", got)
+	default:
 	}
 }
